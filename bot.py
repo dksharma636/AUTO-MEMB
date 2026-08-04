@@ -3036,16 +3036,15 @@ def build_application() -> Application:
     if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE":
         sys.exit("❌ BOT_TOKEN set karo: export BOT_TOKEN='123:ABC'")
 
-    # Create httpx client with timeouts
-    timeout = httpx.Timeout(
-        connect=TG_CONNECT_TIMEOUT,
-        read=TG_READ_TIMEOUT,
-        write=TG_WRITE_TIMEOUT,
-        pool=TG_POOL_TIMEOUT
+    # Create HTTPXRequest with timeout parameters directly (PTB 20.6 API)
+    http_client = HTTPXRequest(
+        connect_timeout=TG_CONNECT_TIMEOUT,
+        read_timeout=TG_READ_TIMEOUT,
+        write_timeout=TG_WRITE_TIMEOUT,
+        pool_timeout=TG_POOL_TIMEOUT,
+        connection_pool_size=TG_POOL_SIZE,
+        http_version="HTTP/1.1"
     )
-    limits = httpx.Limits(max_keepalive_connections=TG_POOL_SIZE, max_connections=TG_POOL_SIZE)
-    client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=False)
-    http_client = HTTPXRequest(client=client, connection_pool_size=TG_POOL_SIZE)
 
     app = (
         ApplicationBuilder()
