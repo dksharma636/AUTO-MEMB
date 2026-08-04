@@ -3043,7 +3043,7 @@ def build_application() -> Application:
         write_timeout=TG_WRITE_TIMEOUT,
         pool_timeout=TG_POOL_TIMEOUT,
         connection_pool_size=TG_POOL_SIZE,
-        http_version="HTTP/1.1"
+        http_version="1.1"  # Fixed: must be '1.1', '2.0', or '2' (no "HTTP/" prefix)
     )
 
     app = (
