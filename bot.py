@@ -4,7 +4,7 @@
 """
 MULTI-TENANT TELEGRAM CHANNEL MANAGEMENT PLATFORM
 Deployable on Render / Heroku / Termux / VPS
-FULLY REPAIRED FOR NETWORK RESILIENCY AND RENDER FREE
+FULLY REPAIRED WITH SQLITE LOCK PROTECTION
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ import io
 import logging
 import os
 import re
-import shutil
 import signal
 import sqlite3
 import sys
@@ -27,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 # ---- Flask for web server ----
-from flask import Flask, render_template_string
+from flask import Flask, jsonify
 
 # ---- Telegram ----
 try:
@@ -83,7 +82,7 @@ BROADCAST_WORKERS = max(1, int(os.getenv("BROADCAST_WORKERS", "5")))
 BROADCAST_DELAY = float(os.getenv("BROADCAST_DELAY", "0.05"))
 BROADCAST_MAX_RETRIES = int(os.getenv("BROADCAST_MAX_RETRIES", "3"))
 
-# HTTP / Telegram timeouts – tunable per environment
+# HTTP / Telegram timeouts
 TG_CONNECT_TIMEOUT = float(os.getenv("TG_CONNECT_TIMEOUT", "30.0"))
 TG_READ_TIMEOUT = float(os.getenv("TG_READ_TIMEOUT", "60.0"))
 TG_WRITE_TIMEOUT = float(os.getenv("TG_WRITE_TIMEOUT", "60.0"))
@@ -126,275 +125,366 @@ def today_iso() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 # ----------------------------------------------------------------------------
-# DATABASE (multi-tenant, migration-versioned)
+# DATABASE WITH FULL LOCK & RETRY
 # ----------------------------------------------------------------------------
-def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, timeout=30)
+_db_lock = threading.Lock()
+DB_RETRY_ATTEMPTS = 5
+DB_RETRY_DELAY = 0.1
+
+def _db_connect():
+    """Create a new database connection with pragmas."""
+    con = sqlite3.connect(DB_PATH, timeout=30.0)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA busy_timeout=30000")
     return con
 
-def _user_version(con: sqlite3.Connection) -> int:
-    return con.execute("PRAGMA user_version").fetchone()[0]
+def db_execute(sql: str, params: tuple = ()) -> sqlite3.Cursor:
+    """Execute a single SQL statement with retry on lock."""
+    attempt = 0
+    while attempt < DB_RETRY_ATTEMPTS:
+        with _db_lock:
+            try:
+                con = _db_connect()
+                cur = con.execute(sql, params)
+                con.commit()
+                con.close()
+                return cur
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower():
+                    attempt += 1
+                    wait = DB_RETRY_DELAY * (2 ** attempt)
+                    log.warning("DB locked, retry %d/%d in %.2fs", attempt, DB_RETRY_ATTEMPTS, wait)
+                    time.sleep(wait)
+                    continue
+                raise
+            except Exception:
+                if con:
+                    con.close()
+                raise
+    raise sqlite3.OperationalError(f"Database locked after {DB_RETRY_ATTEMPTS} attempts")
 
-def _set_user_version(con: sqlite3.Connection, v: int) -> None:
-    con.execute(f"PRAGMA user_version={int(v)}")
+def db_fetchall(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+    """Fetch all rows with retry."""
+    attempt = 0
+    while attempt < DB_RETRY_ATTEMPTS:
+        with _db_lock:
+            try:
+                con = _db_connect()
+                cur = con.execute(sql, params)
+                rows = cur.fetchall()
+                con.close()
+                return rows
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower():
+                    attempt += 1
+                    wait = DB_RETRY_DELAY * (2 ** attempt)
+                    log.warning("DB locked (fetch), retry %d/%d in %.2fs", attempt, DB_RETRY_ATTEMPTS, wait)
+                    time.sleep(wait)
+                    continue
+                raise
+            except Exception:
+                if con:
+                    con.close()
+                raise
+    raise sqlite3.OperationalError(f"Database locked after {DB_RETRY_ATTEMPTS} attempts")
 
-def _col_exists(con: sqlite3.Connection, table: str, col: str) -> bool:
-    rows = con.execute(f"PRAGMA table_info({table})").fetchall()
-    return any(r["name"] == col for r in rows)
+def db_fetchone(sql: str, params: tuple = ()) -> sqlite3.Row | None:
+    rows = db_fetchall(sql, params)
+    return rows[0] if rows else None
 
-def _table_exists(con: sqlite3.Connection, table: str) -> bool:
-    r = con.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    ).fetchone()
-    return r is not None
+def db_executemany(sql: str, params_list: list[tuple]) -> None:
+    """Execute many statements with retry."""
+    attempt = 0
+    while attempt < DB_RETRY_ATTEMPTS:
+        with _db_lock:
+            try:
+                con = _db_connect()
+                con.executemany(sql, params_list)
+                con.commit()
+                con.close()
+                return
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower():
+                    attempt += 1
+                    wait = DB_RETRY_DELAY * (2 ** attempt)
+                    log.warning("DB locked (executemany), retry %d/%d in %.2fs", attempt, DB_RETRY_ATTEMPTS, wait)
+                    time.sleep(wait)
+                    continue
+                raise
+            except Exception:
+                if con:
+                    con.close()
+                raise
+    raise sqlite3.OperationalError(f"Database locked after {DB_RETRY_ATTEMPTS} attempts")
 
-BASE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    first_name TEXT,
-    last_name TEXT,
-    username TEXT,
-    language TEXT,
-    is_premium INTEGER DEFAULT 0,
-    chat_id INTEGER,
-    chat_title TEXT,
-    requested_at TEXT,
-    approved INTEGER DEFAULT 0,
-    welcomed INTEGER DEFAULT 0,
-    blocked INTEGER DEFAULT 0,
-    source TEXT,
-    first_seen TEXT,
-    last_seen TEXT
-);
-
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-
-CREATE TABLE IF NOT EXISTS channels (
-    channel_id INTEGER PRIMARY KEY,
-    title TEXT,
-    username TEXT,
-    owner_user_id INTEGER,
-    added_at TEXT,
-    status TEXT DEFAULT 'ACTIVE',
-    can_invite INTEGER DEFAULT 0,
-    ctype TEXT
-);
-
-CREATE TABLE IF NOT EXISTS channel_settings (
-    channel_id INTEGER PRIMARY KEY,
-    auto_approve INTEGER DEFAULT 1,
-    welcome_enabled INTEGER DEFAULT 1,
-    welcome_text TEXT,
-    pending_text TEXT,
-    broadcast_enabled INTEGER DEFAULT 1,
-    logging_enabled INTEGER DEFAULT 1,
-    scheduler_enabled INTEGER DEFAULT 1,
-    FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS channel_members (
-    channel_id INTEGER,
-    user_id INTEGER,
-    first_name TEXT,
-    username TEXT,
-    approved INTEGER DEFAULT 0,
-    blocked INTEGER DEFAULT 0,
-    joined_at TEXT,
-    PRIMARY KEY(channel_id, user_id)
-);
-
-CREATE TABLE IF NOT EXISTS channel_managers (
-    channel_id INTEGER,
-    user_id INTEGER,
-    added_at TEXT,
-    PRIMARY KEY(channel_id, user_id),
-    FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS channel_manager_permissions (
-    channel_id INTEGER,
-    user_id INTEGER,
-    permission TEXT,
-    PRIMARY KEY(channel_id, user_id, permission)
-);
-
-CREATE TABLE IF NOT EXISTS join_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id INTEGER,
-    user_id INTEGER,
-    status TEXT,
-    created_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS broadcasts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_user_id INTEGER,
-    channel_id INTEGER,
-    kind TEXT,
-    text TEXT,
-    file_id TEXT,
-    caption TEXT,
-    copy_chat_id INTEGER,
-    copy_msg_id INTEGER,
-    audience TEXT,
-    status TEXT DEFAULT 'DRAFT',
-    total INTEGER DEFAULT 0,
-    sent INTEGER DEFAULT 0,
-    failed INTEGER DEFAULT 0,
-    blocked INTEGER DEFAULT 0,
-    created_at TEXT,
-    started_at TEXT,
-    finished_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS broadcast_buttons (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    broadcast_id INTEGER,
-    row_idx INTEGER,
-    col_idx INTEGER,
-    text TEXT,
-    btype TEXT,
-    value TEXT,
-    FOREIGN KEY(broadcast_id) REFERENCES broadcasts(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS scheduled_broadcasts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    broadcast_id INTEGER,
-    scheduled_at TEXT,
-    timezone TEXT,
-    status TEXT DEFAULT 'SCHEDULED',
-    FOREIGN KEY(broadcast_id) REFERENCES broadcasts(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    actor_user_id INTEGER,
-    channel_id INTEGER,
-    action TEXT,
-    metadata TEXT,
-    created_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS ix_channels_owner ON channels(owner_user_id);
-CREATE INDEX IF NOT EXISTS ix_cmembers_channel ON channel_members(channel_id);
-CREATE INDEX IF NOT EXISTS ix_cmembers_user ON channel_members(user_id);
-CREATE INDEX IF NOT EXISTS ix_managers_channel ON channel_managers(channel_id);
-CREATE INDEX IF NOT EXISTS ix_bcast_owner ON broadcasts(owner_user_id);
-CREATE INDEX IF NOT EXISTS ix_bcast_channel ON broadcasts(channel_id);
-CREATE INDEX IF NOT EXISTS ix_bcast_status ON broadcasts(status);
-CREATE INDEX IF NOT EXISTS ix_btargets_bcast ON broadcast_buttons(broadcast_id);
-CREATE INDEX IF NOT EXISTS ix_events_created ON events(created_at);
-CREATE INDEX IF NOT EXISTS ix_sched_status ON scheduled_broadcasts(status);
-"""
-
+# ---- schema and init ----
 def db_init() -> None:
-    """Create schema if missing and run safe migrations without destroying data."""
-    with db() as con:
-        con.executescript(BASE_SCHEMA)
+    """Create schema if missing and run safe migrations with full retry."""
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
 
-        # --- Migration: add created_at to events if missing ---
-        if _table_exists(con, "events") and not _col_exists(con, "events", "created_at"):
-            con.execute("ALTER TABLE events ADD COLUMN created_at TEXT")
-            con.execute("UPDATE events SET created_at=? WHERE created_at IS NULL", (utcnow_iso(),))
+    attempt = 0
+    while attempt < DB_RETRY_ATTEMPTS:
+        with _db_lock:
+            try:
+                con = _db_connect()
+                con.executescript("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id INTEGER PRIMARY KEY,
+                        first_name TEXT,
+                        last_name TEXT,
+                        username TEXT,
+                        language TEXT,
+                        is_premium INTEGER DEFAULT 0,
+                        chat_id INTEGER,
+                        chat_title TEXT,
+                        requested_at TEXT,
+                        approved INTEGER DEFAULT 0,
+                        welcomed INTEGER DEFAULT 0,
+                        blocked INTEGER DEFAULT 0,
+                        source TEXT,
+                        first_seen TEXT,
+                        last_seen TEXT
+                    );
 
-        # --- Migration: add created_at to join_requests if missing ---
-        if _table_exists(con, "join_requests") and not _col_exists(con, "join_requests", "created_at"):
-            con.execute("ALTER TABLE join_requests ADD COLUMN created_at TEXT")
-            con.execute("UPDATE join_requests SET created_at=? WHERE created_at IS NULL", (utcnow_iso(),))
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    );
 
-        # --- Migration: add first_seen / last_seen to users ---
-        for col, ddl in (
-            ("first_seen", "ALTER TABLE users ADD COLUMN first_seen TEXT"),
-            ("last_seen", "ALTER TABLE users ADD COLUMN last_seen TEXT"),
-        ):
-            if not _col_exists(con, "users", col):
-                con.execute(ddl)
+                    CREATE TABLE IF NOT EXISTS channels (
+                        channel_id INTEGER PRIMARY KEY,
+                        title TEXT,
+                        username TEXT,
+                        owner_user_id INTEGER,
+                        added_at TEXT,
+                        status TEXT DEFAULT 'ACTIVE',
+                        can_invite INTEGER DEFAULT 0,
+                        ctype TEXT
+                    );
 
-        con.execute(
-            "UPDATE users SET first_seen=COALESCE(first_seen, requested_at), "
-            "last_seen=COALESCE(last_seen, requested_at) WHERE first_seen IS NULL OR last_seen IS NULL"
-        )
+                    CREATE TABLE IF NOT EXISTS channel_settings (
+                        channel_id INTEGER PRIMARY KEY,
+                        auto_approve INTEGER DEFAULT 1,
+                        welcome_enabled INTEGER DEFAULT 1,
+                        welcome_text TEXT,
+                        pending_text TEXT,
+                        broadcast_enabled INTEGER DEFAULT 1,
+                        logging_enabled INTEGER DEFAULT 1,
+                        scheduler_enabled INTEGER DEFAULT 1,
+                        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+                    );
 
-        if _user_version(con) < SCHEMA_VERSION:
-            _set_user_version(con, SCHEMA_VERSION)
+                    CREATE TABLE IF NOT EXISTS channel_members (
+                        channel_id INTEGER,
+                        user_id INTEGER,
+                        first_name TEXT,
+                        username TEXT,
+                        approved INTEGER DEFAULT 0,
+                        blocked INTEGER DEFAULT 0,
+                        joined_at TEXT,
+                        PRIMARY KEY(channel_id, user_id)
+                    );
 
-        # Global settings
-        set_default("welcome_text", DEFAULT_WELCOME)
-        set_default("pending_text", DEFAULT_PENDING_MSG)
-        set_default("auto_approve", os.getenv("AUTO_APPROVE", "true").lower())
+                    CREATE TABLE IF NOT EXISTS channel_managers (
+                        channel_id INTEGER,
+                        user_id INTEGER,
+                        added_at TEXT,
+                        PRIMARY KEY(channel_id, user_id),
+                        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+                    );
 
-        log.info("DB ready at %s (schema v%s)", DB_PATH, SCHEMA_VERSION)
+                    CREATE TABLE IF NOT EXISTS channel_manager_permissions (
+                        channel_id INTEGER,
+                        user_id INTEGER,
+                        permission TEXT,
+                        PRIMARY KEY(channel_id, user_id, permission)
+                    );
 
-# ---- settings (global key/value) ----
+                    CREATE TABLE IF NOT EXISTS join_requests (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        channel_id INTEGER,
+                        user_id INTEGER,
+                        status TEXT,
+                        created_at TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS broadcasts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        owner_user_id INTEGER,
+                        channel_id INTEGER,
+                        kind TEXT,
+                        text TEXT,
+                        file_id TEXT,
+                        caption TEXT,
+                        copy_chat_id INTEGER,
+                        copy_msg_id INTEGER,
+                        audience TEXT,
+                        status TEXT DEFAULT 'DRAFT',
+                        total INTEGER DEFAULT 0,
+                        sent INTEGER DEFAULT 0,
+                        failed INTEGER DEFAULT 0,
+                        blocked INTEGER DEFAULT 0,
+                        created_at TEXT,
+                        started_at TEXT,
+                        finished_at TEXT
+                    );
+
+                    CREATE TABLE IF NOT EXISTS broadcast_buttons (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        broadcast_id INTEGER,
+                        row_idx INTEGER,
+                        col_idx INTEGER,
+                        text TEXT,
+                        btype TEXT,
+                        value TEXT,
+                        FOREIGN KEY(broadcast_id) REFERENCES broadcasts(id) ON DELETE CASCADE
+                    );
+
+                    CREATE TABLE IF NOT EXISTS scheduled_broadcasts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        broadcast_id INTEGER,
+                        scheduled_at TEXT,
+                        timezone TEXT,
+                        status TEXT DEFAULT 'SCHEDULED',
+                        FOREIGN KEY(broadcast_id) REFERENCES broadcasts(id) ON DELETE CASCADE
+                    );
+
+                    CREATE TABLE IF NOT EXISTS events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        actor_user_id INTEGER,
+                        channel_id INTEGER,
+                        action TEXT,
+                        metadata TEXT,
+                        created_at TEXT
+                    );
+
+                    CREATE INDEX IF NOT EXISTS ix_channels_owner ON channels(owner_user_id);
+                    CREATE INDEX IF NOT EXISTS ix_cmembers_channel ON channel_members(channel_id);
+                    CREATE INDEX IF NOT EXISTS ix_cmembers_user ON channel_members(user_id);
+                    CREATE INDEX IF NOT EXISTS ix_managers_channel ON channel_managers(channel_id);
+                    CREATE INDEX IF NOT EXISTS ix_bcast_owner ON broadcasts(owner_user_id);
+                    CREATE INDEX IF NOT EXISTS ix_bcast_channel ON broadcasts(channel_id);
+                    CREATE INDEX IF NOT EXISTS ix_bcast_status ON broadcasts(status);
+                    CREATE INDEX IF NOT EXISTS ix_btargets_bcast ON broadcast_buttons(broadcast_id);
+                    CREATE INDEX IF NOT EXISTS ix_events_created ON events(created_at);
+                    CREATE INDEX IF NOT EXISTS ix_sched_status ON scheduled_broadcasts(status);
+                """)
+
+                # Migrations
+                def col_exists(table, col):
+                    res = con.execute(f"PRAGMA table_info({table})").fetchall()
+                    return any(r["name"] == col for r in res)
+
+                if col_exists("events", "created_at") is False:
+                    con.execute("ALTER TABLE events ADD COLUMN created_at TEXT")
+                    con.execute("UPDATE events SET created_at=? WHERE created_at IS NULL", (utcnow_iso(),))
+                if col_exists("join_requests", "created_at") is False:
+                    con.execute("ALTER TABLE join_requests ADD COLUMN created_at TEXT")
+                    con.execute("UPDATE join_requests SET created_at=? WHERE created_at IS NULL", (utcnow_iso(),))
+                for col in ("first_seen", "last_seen"):
+                    if col_exists("users", col) is False:
+                        con.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+                con.execute(
+                    "UPDATE users SET first_seen=COALESCE(first_seen, requested_at), "
+                    "last_seen=COALESCE(last_seen, requested_at) "
+                    "WHERE first_seen IS NULL OR last_seen IS NULL"
+                )
+
+                ver = con.execute("PRAGMA user_version").fetchone()[0]
+                if ver < SCHEMA_VERSION:
+                    con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+                # Default settings
+                con.execute(
+                    "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                    ("welcome_text", DEFAULT_WELCOME)
+                )
+                con.execute(
+                    "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                    ("pending_text", DEFAULT_PENDING_MSG)
+                )
+                con.execute(
+                    "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                    ("auto_approve", os.getenv("AUTO_APPROVE", "true").lower())
+                )
+
+                con.commit()
+                con.close()
+                log.info("DB ready at %s (schema v%s)", DB_PATH, SCHEMA_VERSION)
+                return
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e).lower():
+                    attempt += 1
+                    wait = DB_RETRY_DELAY * (2 ** attempt)
+                    log.warning("DB init locked, retry %d/%d in %.2fs", attempt, DB_RETRY_ATTEMPTS, wait)
+                    time.sleep(wait)
+                    continue
+                raise
+            except Exception:
+                if con:
+                    con.close()
+                raise
+    raise sqlite3.OperationalError(f"Database locked after {DB_RETRY_ATTEMPTS} attempts during init")
+
+# ---- settings ----
 def get_setting(key: str, default: str = "") -> str:
-    with db() as con:
-        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else default
+    row = db_fetchone("SELECT value FROM settings WHERE key=?", (key,))
+    return row["value"] if row else default
 
 def set_setting(key: str, value: str) -> None:
-    with db() as con:
-        con.execute(
-            "INSERT INTO settings(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
+    db_execute(
+        "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value)
+    )
 
 def set_default(key: str, value: str) -> None:
-    with db() as con:
-        con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
+    db_execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
 
 # ---- users ----
 def save_user(user, chat=None, *, approved=0, welcomed=0, source="join_request") -> None:
     now = utcnow_iso()
-    with db() as con:
-        con.execute(
-            """
-            INSERT INTO users (user_id, first_name, last_name, username, language,
-                is_premium, chat_id, chat_title, requested_at,
-                approved, welcomed, source, first_seen, last_seen)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                first_name = excluded.first_name,
-                last_name = excluded.last_name,
-                username = excluded.username,
-                language = excluded.language,
-                chat_id = COALESCE(excluded.chat_id, users.chat_id),
-                chat_title = COALESCE(excluded.chat_title, users.chat_title),
-                approved = MAX(users.approved, excluded.approved),
-                welcomed = MAX(users.welcomed, excluded.welcomed),
-                blocked = 0,
-                last_seen = excluded.last_seen
-            """,
-            (
-                user.id, user.first_name, user.last_name, user.username,
-                user.language_code, int(bool(getattr(user, "is_premium", False))),
-                chat.id if chat else None, chat.title if chat else None,
-                now, approved, welcomed, source, now, now,
-            ),
-        )
+    db_execute(
+        """
+        INSERT INTO users (user_id, first_name, last_name, username, language,
+            is_premium, chat_id, chat_title, requested_at,
+            approved, welcomed, source, first_seen, last_seen)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            first_name = excluded.first_name,
+            last_name = excluded.last_name,
+            username = excluded.username,
+            language = excluded.language,
+            chat_id = COALESCE(excluded.chat_id, users.chat_id),
+            chat_title = COALESCE(excluded.chat_title, users.chat_title),
+            approved = MAX(users.approved, excluded.approved),
+            welcomed = MAX(users.welcomed, excluded.welcomed),
+            blocked = 0,
+            last_seen = excluded.last_seen
+        """,
+        (
+            user.id, user.first_name, user.last_name, user.username,
+            user.language_code, int(bool(getattr(user, "is_premium", False))),
+            chat.id if chat else None, chat.title if chat else None,
+            now, approved, welcomed, source, now, now,
+        ),
+    )
 
 def mark(user_id: int, field_: str, value: int = 1) -> None:
     if field_ not in {"approved", "welcomed", "blocked"}:
         return
-    with db() as con:
-        con.execute(f"UPDATE users SET {field_}=? WHERE user_id=?", (value, user_id))
+    db_execute(f"UPDATE users SET {field_}=? WHERE user_id=?", (value, user_id))
 
 def log_event(action: str, *, actor_user_id: int | None = None,
               channel_id: int | None = None, metadata: str = "") -> None:
-    with db() as con:
-        con.execute(
-            "INSERT INTO events(actor_user_id,channel_id,action,metadata,created_at) "
-            "VALUES(?,?,?,?,?)",
-            (actor_user_id, channel_id, action, metadata, utcnow_iso()),
-        )
+    db_execute(
+        "INSERT INTO events(actor_user_id,channel_id,action,metadata,created_at) "
+        "VALUES(?,?,?,?,?)",
+        (actor_user_id, channel_id, action, metadata, utcnow_iso()),
+    )
 
 # ----------------------------------------------------------------------------
 # ROLES & OWNERSHIP
@@ -405,32 +495,29 @@ def is_super_admin(user_id: int) -> bool:
     return bool(ADMIN_IDS) and user_id in ADMIN_IDS
 
 def get_channel(channel_id: int) -> sqlite3.Row | None:
-    with db() as con:
-        return con.execute(
-            "SELECT * FROM channels WHERE channel_id=? AND status!='REMOVED'",
-            (channel_id,),
-        ).fetchone()
+    return db_fetchone(
+        "SELECT * FROM channels WHERE channel_id=? AND status!='REMOVED'",
+        (channel_id,)
+    )
 
 def user_owns_channel(user_id: int, channel_id: int) -> bool:
     ch = get_channel(channel_id)
     return bool(ch and ch["owner_user_id"] == user_id)
 
 def user_is_manager(user_id: int, channel_id: int) -> bool:
-    with db() as con:
-        r = con.execute(
-            "SELECT 1 FROM channel_managers WHERE channel_id=? AND user_id=?",
-            (channel_id, user_id),
-        ).fetchone()
-        return r is not None
+    r = db_fetchone(
+        "SELECT 1 FROM channel_managers WHERE channel_id=? AND user_id=?",
+        (channel_id, user_id)
+    )
+    return r is not None
 
 def manager_permissions(user_id: int, channel_id: int) -> set[str]:
-    with db() as con:
-        rows = con.execute(
-            "SELECT permission FROM channel_manager_permissions "
-            "WHERE channel_id=? AND user_id=?",
-            (channel_id, user_id),
-        ).fetchall()
-        return {r["permission"] for r in rows}
+    rows = db_fetchall(
+        "SELECT permission FROM channel_manager_permissions "
+        "WHERE channel_id=? AND user_id=?",
+        (channel_id, user_id)
+    )
+    return {r["permission"] for r in rows}
 
 def can_access_channel(user_id: int, channel_id: int) -> bool:
     if is_super_admin(user_id):
@@ -449,65 +536,54 @@ def has_permission(user_id: int, channel_id: int, permission: str) -> bool:
     return False
 
 def user_channels(user_id: int) -> list[sqlite3.Row]:
-    with db() as con:
-        if is_super_admin(user_id):
-            return con.execute(
-                "SELECT * FROM channels WHERE status!='REMOVED' ORDER BY added_at DESC"
-            ).fetchall()
-        return con.execute(
-            """
-            SELECT * FROM channels
-            WHERE status!='REMOVED' AND (
-                owner_user_id=? OR
-                channel_id IN (SELECT channel_id FROM channel_managers WHERE user_id=?)
-            )
-            ORDER BY added_at DESC
-            """,
-            (user_id, user_id),
-        ).fetchall()
+    if is_super_admin(user_id):
+        return db_fetchall(
+            "SELECT * FROM channels WHERE status!='REMOVED' ORDER BY added_at DESC"
+        )
+    return db_fetchall(
+        """
+        SELECT * FROM channels
+        WHERE status!='REMOVED' AND (
+            owner_user_id=? OR
+            channel_id IN (SELECT channel_id FROM channel_managers WHERE user_id=?)
+        )
+        ORDER BY added_at DESC
+        """,
+        (user_id, user_id),
+    )
 
 # ---- channel + per-channel settings ----
 def channel_upsert(*, channel_id: int, title: str, username: str | None,
                    owner_user_id: int, can_invite: int, ctype: str) -> None:
-    with db() as con:
-        con.execute(
-            """
-            INSERT INTO channels(channel_id,title,username,owner_user_id,added_at,
-                status,can_invite,ctype)
-            VALUES(?,?,?,?,?,?,?,?)
-            ON CONFLICT(channel_id) DO UPDATE SET
-                title=excluded.title,
-                username=excluded.username,
-                status='ACTIVE',
-                can_invite=excluded.can_invite,
-                ctype=excluded.ctype
-            """,
-            (channel_id, title, username, owner_user_id, utcnow_iso(),
-             "ACTIVE", can_invite, ctype),
-        )
-        con.execute(
-            """
-            INSERT OR IGNORE INTO channel_settings(channel_id, welcome_text, pending_text)
-            VALUES(?,?,?)
-            """,
-            (channel_id, DEFAULT_WELCOME, DEFAULT_PENDING_MSG),
-        )
+    db_execute(
+        """
+        INSERT INTO channels(channel_id,title,username,owner_user_id,added_at,
+            status,can_invite,ctype)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(channel_id) DO UPDATE SET
+            title=excluded.title,
+            username=excluded.username,
+            status='ACTIVE',
+            can_invite=excluded.can_invite,
+            ctype=excluded.ctype
+        """,
+        (channel_id, title, username, owner_user_id, utcnow_iso(),
+         "ACTIVE", can_invite, ctype),
+    )
+    db_execute(
+        "INSERT OR IGNORE INTO channel_settings(channel_id, welcome_text, pending_text) VALUES(?,?,?)",
+        (channel_id, DEFAULT_WELCOME, DEFAULT_PENDING_MSG),
+    )
 
 def channel_settings(channel_id: int) -> sqlite3.Row:
-    with db() as con:
-        row = con.execute(
-            "SELECT * FROM channel_settings WHERE channel_id=?", (channel_id,)
-        ).fetchone()
-        if row is None:
-            con.execute(
-                "INSERT OR IGNORE INTO channel_settings(channel_id,welcome_text,pending_text) "
-                "VALUES(?,?,?)",
-                (channel_id, DEFAULT_WELCOME, DEFAULT_PENDING_MSG),
-            )
-            row = con.execute(
-                "SELECT * FROM channel_settings WHERE channel_id=?", (channel_id,)
-            ).fetchone()
-        return row
+    row = db_fetchone("SELECT * FROM channel_settings WHERE channel_id=?", (channel_id,))
+    if row is None:
+        db_execute(
+            "INSERT OR IGNORE INTO channel_settings(channel_id,welcome_text,pending_text) VALUES(?,?,?)",
+            (channel_id, DEFAULT_WELCOME, DEFAULT_PENDING_MSG),
+        )
+        row = db_fetchone("SELECT * FROM channel_settings WHERE channel_id=?", (channel_id,))
+    return row
 
 def set_channel_setting(channel_id: int, key: str, value) -> None:
     allowed = {
@@ -516,75 +592,49 @@ def set_channel_setting(channel_id: int, key: str, value) -> None:
     }
     if key not in allowed:
         return
-    with db() as con:
-        con.execute(
-            f"UPDATE channel_settings SET {key}=? WHERE channel_id=?",
-            (value, channel_id),
-        )
+    db_execute(f"UPDATE channel_settings SET {key}=? WHERE channel_id=?", (value, channel_id))
 
 def channel_stats(channel_id: int) -> dict:
-    with db() as con:
-        c = con.cursor()
-        total = c.execute(
-            "SELECT COUNT() FROM channel_members WHERE channel_id=?", (channel_id,)
-        ).fetchone()[0]
-        appr = c.execute(
-            "SELECT COUNT() FROM channel_members WHERE channel_id=? AND approved=1",
-            (channel_id,),
-        ).fetchone()[0]
-        blk = c.execute(
-            "SELECT COUNT() FROM channel_members WHERE channel_id=? AND blocked=1",
-            (channel_id,),
-        ).fetchone()[0]
-        pend = c.execute(
-            "SELECT COUNT() FROM join_requests WHERE channel_id=? AND status='PENDING'",
-            (channel_id,),
-        ).fetchone()[0]
-        return {"total": total, "approved": appr, "blocked": blk, "pending": pend}
+    total = db_fetchone("SELECT COUNT() FROM channel_members WHERE channel_id=?", (channel_id,))[0]
+    appr = db_fetchone("SELECT COUNT() FROM channel_members WHERE channel_id=? AND approved=1", (channel_id,))[0]
+    blk = db_fetchone("SELECT COUNT() FROM channel_members WHERE channel_id=? AND blocked=1", (channel_id,))[0]
+    pend = db_fetchone("SELECT COUNT() FROM join_requests WHERE channel_id=? AND status='PENDING'", (channel_id,))[0]
+    return {"total": total, "approved": appr, "blocked": blk, "pending": pend}
 
 def channel_member_upsert(channel_id, user, *, approved=0) -> None:
-    with db() as con:
-        con.execute(
-            """
-            INSERT INTO channel_members(channel_id,user_id,first_name,username,
-                approved,joined_at)
-            VALUES(?,?,?,?,?,?)
-            ON CONFLICT(channel_id,user_id) DO UPDATE SET
-                first_name=excluded.first_name,
-                username=excluded.username,
-                approved=MAX(channel_members.approved, excluded.approved),
-                blocked=0
-            """,
-            (channel_id, user.id, user.first_name, user.username, approved, utcnow_iso()),
-        )
+    db_execute(
+        """
+        INSERT INTO channel_members(channel_id,user_id,first_name,username,
+            approved,joined_at)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(channel_id,user_id) DO UPDATE SET
+            first_name=excluded.first_name,
+            username=excluded.username,
+            approved=MAX(channel_members.approved, excluded.approved),
+            blocked=0
+        """,
+        (channel_id, user.id, user.first_name, user.username, approved, utcnow_iso()),
+    )
 
 def channel_member_mark(channel_id: int, user_id: int, field_: str, value: int = 1) -> None:
     if field_ not in {"approved", "blocked"}:
         return
-    with db() as con:
-        con.execute(
-            f"UPDATE channel_members SET {field_}=? WHERE channel_id=? AND user_id=?",
-            (value, channel_id, user_id),
-        )
+    db_execute(
+        f"UPDATE channel_members SET {field_}=? WHERE channel_id=? AND user_id=?",
+        (value, channel_id, user_id),
+    )
 
 # ---- global stats ----
 def stats() -> dict:
-    with db() as con:
-        c = con.cursor()
-        total = c.execute("SELECT COUNT() FROM users").fetchone()[0]
-        appr = c.execute("SELECT COUNT() FROM users WHERE approved=1").fetchone()[0]
-        welc = c.execute("SELECT COUNT() FROM users WHERE welcomed=1").fetchone()[0]
-        blk = c.execute("SELECT COUNT() FROM users WHERE blocked=1").fetchone()[0]
-        today = c.execute(
-            "SELECT COUNT() FROM users WHERE substr(requested_at,1,10)=?",
-            (today_iso(),),
-        ).fetchone()[0]
-        channels = c.execute(
-            "SELECT COUNT() FROM channels WHERE status!='REMOVED'"
-        ).fetchone()[0]
-        campaigns = c.execute("SELECT COUNT(*) FROM broadcasts").fetchone()[0]
-        return {"total": total, "approved": appr, "welcomed": welc, "blocked": blk,
-                "today": today, "channels": channels, "campaigns": campaigns}
+    total = db_fetchone("SELECT COUNT() FROM users")[0]
+    appr = db_fetchone("SELECT COUNT() FROM users WHERE approved=1")[0]
+    welc = db_fetchone("SELECT COUNT() FROM users WHERE welcomed=1")[0]
+    blk = db_fetchone("SELECT COUNT() FROM users WHERE blocked=1")[0]
+    today = db_fetchone("SELECT COUNT() FROM users WHERE substr(requested_at,1,10)=?", (today_iso(),))[0]
+    channels = db_fetchone("SELECT COUNT() FROM channels WHERE status!='REMOVED'")[0]
+    campaigns = db_fetchone("SELECT COUNT(*) FROM broadcasts")[0]
+    return {"total": total, "approved": appr, "welcomed": welc, "blocked": blk,
+            "today": today, "channels": channels, "campaigns": campaigns}
 
 # ----------------------------------------------------------------------------
 # TEXT HELPERS
@@ -1050,28 +1100,27 @@ async def show_managers(update: Update, context: ContextTypes.DEFAULT_TYPE, cid:
     if not (is_super_admin(user.id) or user_owns_channel(user.id, cid)):
         await deny(update, "Sirf channel owner managers add kar sakta hai.")
         return
-    with db() as con:
-        mgrs = con.execute(
-            "SELECT user_id FROM channel_managers WHERE channel_id=?", (cid,)
-        ).fetchall()
-        lines = ["👥 MANAGERS\n"]
-        if not mgrs:
-            lines.append("Abhi koi manager nahi hai.")
-        else:
-            for m in mgrs:
-                perms = manager_permissions(m["user_id"], cid)
-                lines.append(
-                    f"• {m['user_id']} — {', '.join(sorted(perms)) or 'no permissions'}")
-        rows = [
-            [InlineKeyboardButton("➕ Add Manager", callback_data=f"mgr:add:{cid}")],
-        ]
+    mgrs = db_fetchall(
+        "SELECT user_id FROM channel_managers WHERE channel_id=?", (cid,)
+    )
+    lines = ["👥 MANAGERS\n"]
+    if not mgrs:
+        lines.append("Abhi koi manager nahi hai.")
+    else:
         for m in mgrs:
-            rows.append([
-                InlineKeyboardButton(f"🔧 {m['user_id']}", callback_data=f"mgr:perm:{m['user_id']}:{cid}"),
-                InlineKeyboardButton("🗑", callback_data=f"mgr:del:{m['user_id']}:{cid}"),
-            ])
-        rows.append(nav_row(f"ch:{cid}"))
-        await ui_edit(update, "\n".join(lines), kb(rows))
+            perms = manager_permissions(m["user_id"], cid)
+            lines.append(
+                f"• {m['user_id']} — {', '.join(sorted(perms)) or 'no permissions'}")
+    rows = [
+        [InlineKeyboardButton("➕ Add Manager", callback_data=f"mgr:add:{cid}")],
+    ]
+    for m in mgrs:
+        rows.append([
+            InlineKeyboardButton(f"🔧 {m['user_id']}", callback_data=f"mgr:perm:{m['user_id']}:{cid}"),
+            InlineKeyboardButton("🗑", callback_data=f"mgr:del:{m['user_id']}:{cid}"),
+        ])
+    rows.append(nav_row(f"ch:{cid}"))
+    await ui_edit(update, "\n".join(lines), kb(rows))
 
 async def manager_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int) -> None:
     _ud(context)["flow"] = "add_manager"
@@ -1110,17 +1159,18 @@ async def manager_perm_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE
     if perm not in PERMISSIONS:
         return
     perms = manager_permissions(mgr_id, cid)
-    with db() as con:
-        if perm in perms:
-            con.execute(
-                "DELETE FROM channel_manager_permissions "
-                "WHERE channel_id=? AND user_id=? AND permission=?",
-                (cid, mgr_id, perm))
-        else:
-            con.execute(
-                "INSERT OR IGNORE INTO channel_manager_permissions"
-                "(channel_id,user_id,permission) VALUES(?,?,?)",
-                (cid, mgr_id, perm))
+    if perm in perms:
+        db_execute(
+            "DELETE FROM channel_manager_permissions "
+            "WHERE channel_id=? AND user_id=? AND permission=?",
+            (cid, mgr_id, perm)
+        )
+    else:
+        db_execute(
+            "INSERT OR IGNORE INTO channel_manager_permissions"
+            "(channel_id,user_id,permission) VALUES(?,?,?)",
+            (cid, mgr_id, perm)
+        )
     await manager_perm_screen(update, context, mgr_id, cid)
 
 async def manager_delete(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -1129,11 +1179,8 @@ async def manager_delete(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not (is_super_admin(user.id) or user_owns_channel(user.id, cid)):
         await deny(update, "Delete denied.")
         return
-    with db() as con:
-        con.execute("DELETE FROM channel_managers WHERE channel_id=? AND user_id=?",
-                    (cid, mgr_id))
-        con.execute("DELETE FROM channel_manager_permissions WHERE channel_id=? AND user_id=?",
-                    (cid, mgr_id))
+    db_execute("DELETE FROM channel_managers WHERE channel_id=? AND user_id=?", (cid, mgr_id))
+    db_execute("DELETE FROM channel_manager_permissions WHERE channel_id=? AND user_id=?", (cid, mgr_id))
     log_event("MANAGER_REMOVED", actor_user_id=user.id, channel_id=cid, metadata=str(mgr_id))
     await show_managers(update, context, cid)
 
@@ -1157,10 +1204,11 @@ async def show_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await deny(update, "Analytics permission nahi hai.")
         return
     cutoff = _period_cutoff(period)
-    with db() as con:
+    with _db_lock:  # we need a transaction for multiple queries
+        con = _db_connect()
         c = con.cursor()
         base = "SELECT COUNT(*) FROM channel_members WHERE channel_id=?"
-        args: list = [cid]
+        args = [cid]
         if cutoff:
             new_users = c.execute(base + " AND joined_at>=?", (cid, cutoff)).fetchone()[0]
         else:
@@ -1173,7 +1221,8 @@ async def show_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if cutoff:
             joins = c.execute(jr_base + " AND created_at>=?", (cid, cutoff)).fetchone()[0]
             approvals = c.execute(
-                jr_base + " AND status='APPROVED' AND created_at>=?", (cid, cutoff)).fetchone()[0]
+                jr_base + " AND status='APPROVED' AND created_at>=?", (cid, cutoff)
+            ).fetchone()[0]
         else:
             joins = c.execute(jr_base, (cid,)).fetchone()[0]
             approvals = c.execute(jr_base + " AND status='APPROVED'", (cid,)).fetchone()[0]
@@ -1187,6 +1236,7 @@ async def show_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE,
             bc_count = c.execute(bc_base, (cid,)).fetchone()[0]
         success = (bsent[0] / bsent[1] * 100) if bsent[1] else 0.0
         active = total - blocked
+        con.close()
 
     text = (
         "📊 <b>ANALYTICS</b>\n"
@@ -1222,20 +1272,18 @@ AUDIENCE_LABELS = {
 }
 
 def create_broadcast(owner_user_id: int, channel_id: int | None) -> int:
-    with db() as con:
-        cur = con.execute(
-            "INSERT INTO broadcasts(owner_user_id,channel_id,kind,audience,status,created_at) "
-            "VALUES(?,?,?,?,?,?)",
-            (owner_user_id, channel_id, "text", "EXCLUDE_BLOCKED", "DRAFT", utcnow_iso()),
-        )
-        bid = cur.lastrowid
-        log_event("BROADCAST_CREATED", actor_user_id=owner_user_id, channel_id=channel_id,
-                  metadata=f"broadcast={bid}")
-        return bid
+    cur = db_execute(
+        "INSERT INTO broadcasts(owner_user_id,channel_id,kind,audience,status,created_at) "
+        "VALUES(?,?,?,?,?,?)",
+        (owner_user_id, channel_id, "text", "EXCLUDE_BLOCKED", "DRAFT", utcnow_iso()),
+    )
+    bid = cur.lastrowid
+    log_event("BROADCAST_CREATED", actor_user_id=owner_user_id, channel_id=channel_id,
+              metadata=f"broadcast={bid}")
+    return bid
 
 def get_broadcast(bid: int) -> sqlite3.Row | None:
-    with db() as con:
-        return con.execute("SELECT * FROM broadcasts WHERE id=?", (bid,)).fetchone()
+    return db_fetchone("SELECT * FROM broadcasts WHERE id=?", (bid,))
 
 def owns_broadcast(user_id: int, bid: int) -> bool:
     b = get_broadcast(bid)
@@ -1253,65 +1301,62 @@ def update_broadcast(bid: int, **fields) -> None:
     if not fields:
         return
     cols = ", ".join(f"{k}=?" for k in fields)
-    with db() as con:
-        con.execute(f"UPDATE broadcasts SET {cols} WHERE id=?",
-                    (*fields.values(), bid))
+    db_execute(f"UPDATE broadcasts SET {cols} WHERE id=?", (*fields.values(), bid))
 
 # ---- audience resolution ----
 def resolve_audience_ids(b: sqlite3.Row) -> list[int]:
     aud = b["audience"] or "EXCLUDE_BLOCKED"
     cid = b["channel_id"]
-    with db() as con:
-        if cid:
-            q = "SELECT user_id FROM channel_members WHERE channel_id=?"
-            args: list = [cid]
+    if cid:
+        q = "SELECT user_id FROM channel_members WHERE channel_id=?"
+        args = [cid]
+        if aud in ("ACTIVE", "EXCLUDE_BLOCKED"):
+            q += " AND blocked=0"
+        elif aud == "TODAY":
+            q += " AND substr(joined_at,1,10)=?"
+            args.append(today_iso())
+        elif aud == "LAST7":
+            q += " AND joined_at>=?"
+            args.append((datetime.now(timezone.utc) - timedelta(days=7)).isoformat())
+        rows = db_fetchall(q, tuple(args))
+    else:
+        if aud == "OWNERS":
+            rows = db_fetchall(
+                "SELECT DISTINCT owner_user_id AS user_id FROM channels "
+                "WHERE status!='REMOVED' AND owner_user_id IS NOT NULL"
+            )
+        else:
+            q = "SELECT user_id FROM users"
+            args = []
             if aud in ("ACTIVE", "EXCLUDE_BLOCKED"):
-                q += " AND blocked=0"
+                q += " WHERE blocked=0"
             elif aud == "TODAY":
-                q += " AND substr(joined_at,1,10)=?"
+                q += " WHERE substr(requested_at,1,10)=?"
                 args.append(today_iso())
             elif aud == "LAST7":
-                q += " AND joined_at>=?"
+                q += " WHERE requested_at>=?"
                 args.append((datetime.now(timezone.utc) - timedelta(days=7)).isoformat())
-            rows = con.execute(q, tuple(args)).fetchall()
-        else:
-            if aud == "OWNERS":
-                rows = con.execute(
-                    "SELECT DISTINCT owner_user_id AS user_id FROM channels "
-                    "WHERE status!='REMOVED' AND owner_user_id IS NOT NULL"
-                ).fetchall()
-            else:
-                q = "SELECT user_id FROM users"
-                args = []
-                if aud in ("ACTIVE", "EXCLUDE_BLOCKED"):
-                    q += " WHERE blocked=0"
-                elif aud == "TODAY":
-                    q += " WHERE substr(requested_at,1,10)=?"
-                    args.append(today_iso())
-                elif aud == "LAST7":
-                    q += " WHERE requested_at>=?"
-                    args.append((datetime.now(timezone.utc) - timedelta(days=7)).isoformat())
-                rows = con.execute(q, tuple(args)).fetchall()
-        return list({r["user_id"] for r in rows if r["user_id"]})
+            rows = db_fetchall(q, tuple(args))
+    return list({r["user_id"] for r in rows if r["user_id"]})
 
 def audience_estimate(b: sqlite3.Row) -> tuple[int, int]:
     ids = resolve_audience_ids(b)
     cid = b["channel_id"]
-    with db() as con:
-        if cid:
-            blocked = con.execute(
-                "SELECT COUNT() FROM channel_members WHERE channel_id=? AND blocked=1",
-                (cid,)).fetchone()[0]
-        else:
-            blocked = con.execute("SELECT COUNT() FROM users WHERE blocked=1").fetchone()[0]
-        return len(ids), blocked
+    if cid:
+        blocked = db_fetchone(
+            "SELECT COUNT() FROM channel_members WHERE channel_id=? AND blocked=1",
+            (cid,)
+        )[0]
+    else:
+        blocked = db_fetchone("SELECT COUNT() FROM users WHERE blocked=1")[0]
+    return len(ids), blocked
 
 # ---- broadcast buttons ----
 def broadcast_buttons(bid: int) -> list[sqlite3.Row]:
-    with db() as con:
-        return con.execute(
-            "SELECT * FROM broadcast_buttons WHERE broadcast_id=? ORDER BY row_idx,col_idx",
-            (bid,)).fetchall()
+    return db_fetchall(
+        "SELECT * FROM broadcast_buttons WHERE broadcast_id=? ORDER BY row_idx,col_idx",
+        (bid,)
+    )
 
 def build_button_markup(bid: int) -> InlineKeyboardMarkup | None:
     rows_map: dict[int, list[InlineKeyboardButton]] = {}
@@ -1447,30 +1492,32 @@ async def bc_add_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE
                   kb([nav_row(f"bc:btns:{bid}")]))
 
 def add_button(bid: int, text: str, btype: str, value: str, new_row: bool) -> None:
-    with db() as con:
-        maxrow = con.execute(
-            "SELECT COALESCE(MAX(row_idx),-1) FROM broadcast_buttons WHERE broadcast_id=?",
-            (bid,)).fetchone()[0]
-        if new_row or maxrow < 0:
-            row_idx = maxrow + 1
-            col_idx = 0
-        else:
-            row_idx = maxrow
-            col_idx = con.execute(
-                "SELECT COALESCE(MAX(col_idx),-1)+1 FROM broadcast_buttons "
-                "WHERE broadcast_id=? AND row_idx=?", (bid, row_idx)).fetchone()[0]
-        con.execute(
-            "INSERT INTO broadcast_buttons(broadcast_id,row_idx,col_idx,text,btype,value) "
-            "VALUES(?,?,?,?,?,?)",
-            (bid, row_idx, col_idx, text, btype, value))
+    maxrow = db_fetchone(
+        "SELECT COALESCE(MAX(row_idx),-1) FROM broadcast_buttons WHERE broadcast_id=?",
+        (bid,)
+    )[0]
+    if new_row or maxrow < 0:
+        row_idx = maxrow + 1
+        col_idx = 0
+    else:
+        row_idx = maxrow
+        col_idx = db_fetchone(
+            "SELECT COALESCE(MAX(col_idx),-1)+1 FROM broadcast_buttons "
+            "WHERE broadcast_id=? AND row_idx=?", (bid, row_idx)
+        )[0]
+    db_execute(
+        "INSERT INTO broadcast_buttons(broadcast_id,row_idx,col_idx,text,btype,value) "
+        "VALUES(?,?,?,?,?,?)",
+        (bid, row_idx, col_idx, text, btype, value)
+    )
 
 def delete_last_button(bid: int) -> None:
-    with db() as con:
-        last = con.execute(
-            "SELECT id FROM broadcast_buttons WHERE broadcast_id=? "
-            "ORDER BY row_idx DESC, col_idx DESC LIMIT 1", (bid,)).fetchone()
-        if last:
-            con.execute("DELETE FROM broadcast_buttons WHERE id=?", (last["id"],))
+    last = db_fetchone(
+        "SELECT id FROM broadcast_buttons WHERE broadcast_id=? "
+        "ORDER BY row_idx DESC, col_idx DESC LIMIT 1", (bid,)
+    )
+    if last:
+        db_execute("DELETE FROM broadcast_buttons WHERE id=?", (last["id"],))
 
 # ----------------------------------------------------------------------------
 # BROADCAST — preview, send delivery for one recipient
@@ -1578,7 +1625,6 @@ async def _send_worker(bot, b: sqlite3.Row, markup, camp: Campaign,
             uid = queue.get_nowait()
         except asyncio.QueueEmpty:
             return
-        # cooperative pause / stop
         while camp.paused and not camp.stop:
             await asyncio.sleep(0.5)
         if camp.stop:
@@ -1599,7 +1645,6 @@ async def _send_worker(bot, b: sqlite3.Row, markup, camp: Campaign,
                     wait = float(e.retry_after) + 0.5
                     log.warning("RetryAfter for %s: waiting %.1fs", uid, wait)
                     await asyncio.sleep(wait)
-                    # Retry immediately
                     continue
                 except (TimedOut, NetworkError, httpx.ReadTimeout, httpx.ConnectError) as e:
                     wait = min(2 ** (attempt + 1), 30)
@@ -1612,19 +1657,18 @@ async def _send_worker(bot, b: sqlite3.Row, markup, camp: Campaign,
                     mark(uid, "blocked", 1)
                     if b["channel_id"]:
                         channel_member_mark(b["channel_id"], uid, "blocked", 1)
-                    success = True  # considered handled
+                    success = True
                     break
                 except BadRequest as e:
                     log.warning("BadRequest for %s: %s", uid, e)
                     camp.failed += 1
-                    success = True  # handled
+                    success = True
                     break
                 except TelegramError as e:
                     log.warning("TelegramError for %s: %s", uid, e)
                     if attempt >= BROADCAST_MAX_RETRIES:
                         camp.failed += 1
                         success = True
-                    # else will retry
             if not success:
                 camp.failed += 1
             queue.task_done()
@@ -1769,73 +1813,68 @@ async def bc_schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         kb([nav_row(f"bc:compose:{bid}")]))
 
 def schedule_broadcast(bid: int, when_utc: datetime) -> None:
-    with db() as con:
-        con.execute(
-            "INSERT INTO scheduled_broadcasts(broadcast_id,scheduled_at,timezone,status) "
-            "VALUES(?,?,?,?)",
-            (bid, when_utc.isoformat(timespec="seconds"), "UTC", "SCHEDULED"))
-        update_broadcast(bid, status="SCHEDULED")
+    db_execute(
+        "INSERT INTO scheduled_broadcasts(broadcast_id,scheduled_at,timezone,status) "
+        "VALUES(?,?,?,?)",
+        (bid, when_utc.isoformat(timespec="seconds"), "UTC", "SCHEDULED")
+    )
+    update_broadcast(bid, status="SCHEDULED")
 
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = utcnow_iso()
-    with db() as con:
-        due = con.execute(
-            "SELECT s.id AS sid, s.broadcast_id AS bid FROM scheduled_broadcasts s "
-            "JOIN broadcasts b ON b.id=s.broadcast_id "
-            "WHERE s.status='SCHEDULED' AND s.scheduled_at<=? AND b.status NOT IN "
-            "('RUNNING','COMPLETED','CANCELLED')",
-            (now,)).fetchall()
-        for r in due:
-            with db() as con:
-                con.execute("UPDATE scheduled_broadcasts SET status='RUNNING' WHERE id=?",
-                            (r["sid"],))
-            b = get_broadcast(r["bid"])
-            if not b:
-                continue
-            owner = b["owner_user_id"]
-            status = None
-            try:
-                status = await context.bot.send_message(
-                    owner, f"⏰ Scheduled broadcast #{r['bid']} starting…",
-                    parse_mode=ParseMode.HTML)
-            except TelegramError:
-                pass
-            context.application.create_task(run_campaign(
-                context, r["bid"],
-                status.chat_id if status else None,
-                status.message_id if status else None))
-            with db() as con:
-                con.execute("UPDATE scheduled_broadcasts SET status='COMPLETED' WHERE id=?",
-                            (r["sid"],))
+    due = db_fetchall(
+        "SELECT s.id AS sid, s.broadcast_id AS bid FROM scheduled_broadcasts s "
+        "JOIN broadcasts b ON b.id=s.broadcast_id "
+        "WHERE s.status='SCHEDULED' AND s.scheduled_at<=? AND b.status NOT IN "
+        "('RUNNING','COMPLETED','CANCELLED')",
+        (now,)
+    )
+    for r in due:
+        db_execute("UPDATE scheduled_broadcasts SET status='RUNNING' WHERE id=?", (r["sid"],))
+        b = get_broadcast(r["bid"])
+        if not b:
+            continue
+        owner = b["owner_user_id"]
+        status = None
+        try:
+            status = await context.bot.send_message(
+                owner, f"⏰ Scheduled broadcast #{r['bid']} starting…",
+                parse_mode=ParseMode.HTML)
+        except TelegramError:
+            pass
+        context.application.create_task(run_campaign(
+            context, r["bid"],
+            status.chat_id if status else None,
+            status.message_id if status else None))
+        db_execute("UPDATE scheduled_broadcasts SET status='COMPLETED' WHERE id=?", (r["sid"],))
 
 async def show_scheduled(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int) -> None:
     user = update.effective_user
     if not has_permission(user.id, cid, "broadcast"):
         await deny(update, "Broadcast permission nahi hai.")
         return
-    with db() as con:
-        rows = con.execute(
-            "SELECT s.*, b.status AS bstatus FROM scheduled_broadcasts s "
-            "JOIN broadcasts b ON b.id=s.broadcast_id "
-            "WHERE b.channel_id=? AND s.status='SCHEDULED' ORDER BY s.scheduled_at",
-            (cid,)).fetchall()
-        if not rows:
-            await ui_edit(update, "⏰ Scheduled\n\nKoi scheduled campaign nahi hai.",
-                          kb([nav_row(f"ch:{cid}")]))
-            return
-        lines = ["⏰ Scheduled Campaigns\n"]
-        kbrows = []
-        for r in rows:
-            lines.append(f"• #{r['broadcast_id']} at {r['scheduled_at']} UTC")
-            kbrows.append([InlineKeyboardButton(f"🗑 Cancel #{r['broadcast_id']}",
-                                                callback_data=f"sched:del:{r['id']}:{cid}")])
-        kbrows.append(nav_row(f"ch:{cid}"))
-        await ui_edit(update, "\n".join(lines), kb(kbrows))
+    rows = db_fetchall(
+        "SELECT s.*, b.status AS bstatus FROM scheduled_broadcasts s "
+        "JOIN broadcasts b ON b.id=s.broadcast_id "
+        "WHERE b.channel_id=? AND s.status='SCHEDULED' ORDER BY s.scheduled_at",
+        (cid,)
+    )
+    if not rows:
+        await ui_edit(update, "⏰ Scheduled\n\nKoi scheduled campaign nahi hai.",
+                      kb([nav_row(f"ch:{cid}")]))
+        return
+    lines = ["⏰ Scheduled Campaigns\n"]
+    kbrows = []
+    for r in rows:
+        lines.append(f"• #{r['broadcast_id']} at {r['scheduled_at']} UTC")
+        kbrows.append([InlineKeyboardButton(f"🗑 Cancel #{r['broadcast_id']}",
+                                            callback_data=f"sched:del:{r['id']}:{cid}")])
+    kbrows.append(nav_row(f"ch:{cid}"))
+    await ui_edit(update, "\n".join(lines), kb(kbrows))
 
 async def scheduled_delete(update: Update, context: ContextTypes.DEFAULT_TYPE,
                            sid: int, cid: int) -> None:
-    with db() as con:
-        con.execute("UPDATE scheduled_broadcasts SET status='CANCELLED' WHERE id=?", (sid,))
+    db_execute("UPDATE scheduled_broadcasts SET status='CANCELLED' WHERE id=?", (sid,))
     await show_scheduled(update, context, cid)
 
 # ----------------------------------------------------------------------------
@@ -1843,37 +1882,38 @@ async def scheduled_delete(update: Update, context: ContextTypes.DEFAULT_TYPE,
 # ----------------------------------------------------------------------------
 async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int) -> None:
     user = update.effective_user
-    with db() as con:
-        if cid:
-            if not has_permission(user.id, cid, "broadcast"):
-                await deny(update, "Broadcast permission nahi hai.")
-                return
-            rows = con.execute(
-                "SELECT * FROM broadcasts WHERE channel_id=? ORDER BY id DESC LIMIT 15",
-                (cid,)).fetchall()
-        else:
-            if not is_super_admin(user.id):
-                await deny(update, "Admin only.")
-                return
-            rows = con.execute(
-                "SELECT * FROM broadcasts ORDER BY id DESC LIMIT 15").fetchall()
-        if not rows:
-            await ui_edit(update, "📣 Broadcast History\n\nKoi campaign nahi.",
-                          kb([nav_row(f"ch:{cid}" if cid else "admin")]))
+    if cid:
+        if not has_permission(user.id, cid, "broadcast"):
+            await deny(update, "Broadcast permission nahi hai.")
             return
-        lines = ["📣 Broadcast History\n"]
-        kbrows = []
-        for b in rows:
-            lines.append(
-                f"#{b['id']} · {b['status']} · 🎯{b['total']:,} "
-                f"✅{b['sent']:,} ❌{b['failed']:,}")
-            kbrows.append([
-                InlineKeyboardButton(f"👁 #{b['id']}", callback_data=f"hist:view:{b['id']}"),
-                InlineKeyboardButton("🔁", callback_data=f"hist:dup:{b['id']}"),
-                InlineKeyboardButton("🗑", callback_data=f"hist:del:{b['id']}"),
-            ])
-        kbrows.append(nav_row(f"ch:{cid}" if cid else "admin"))
-        await ui_edit(update, "\n".join(lines), kb(kbrows))
+        rows = db_fetchall(
+            "SELECT * FROM broadcasts WHERE channel_id=? ORDER BY id DESC LIMIT 15",
+            (cid,)
+        )
+    else:
+        if not is_super_admin(user.id):
+            await deny(update, "Admin only.")
+            return
+        rows = db_fetchall(
+            "SELECT * FROM broadcasts ORDER BY id DESC LIMIT 15"
+        )
+    if not rows:
+        await ui_edit(update, "📣 Broadcast History\n\nKoi campaign nahi.",
+                      kb([nav_row(f"ch:{cid}" if cid else "admin")]))
+        return
+    lines = ["📣 Broadcast History\n"]
+    kbrows = []
+    for b in rows:
+        lines.append(
+            f"#{b['id']} · {b['status']} · 🎯{b['total']:,} "
+            f"✅{b['sent']:,} ❌{b['failed']:,}")
+        kbrows.append([
+            InlineKeyboardButton(f"👁 #{b['id']}", callback_data=f"hist:view:{b['id']}"),
+            InlineKeyboardButton("🔁", callback_data=f"hist:dup:{b['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"hist:del:{b['id']}"),
+        ])
+    kbrows.append(nav_row(f"ch:{cid}" if cid else "admin"))
+    await ui_edit(update, "\n".join(lines), kb(kbrows))
 
 async def history_view(update: Update, context: ContextTypes.DEFAULT_TYPE, bid: int) -> None:
     user = update.effective_user
@@ -1922,8 +1962,7 @@ async def history_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, bid
                                            show_alert=True)
         return
     cid = get_broadcast(bid)["channel_id"] or 0
-    with db() as con:
-        con.execute("DELETE FROM broadcasts WHERE id=?", (bid,))
+    db_execute("DELETE FROM broadcasts WHERE id=?", (bid,))
     await show_history(update, context, cid)
 
 # ----------------------------------------------------------------------------
@@ -1941,26 +1980,25 @@ async def show_users(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await deny(update, "Admin only.")
             return
 
-    with db() as con:
-        if cid:
-            q = "SELECT user_id, first_name, username, approved, blocked, joined_at " \
-                "FROM channel_members WHERE channel_id=?"
-            args: list = [cid]
-        else:
-            q = "SELECT user_id, first_name, username, approved, blocked, requested_at AS joined_at, " \
-                "is_premium FROM users WHERE 1=1"
-            args = []
-        if flt == "ACTIVE":
-            q += " AND blocked=0"
-        elif flt == "BLOCKED":
-            q += " AND blocked=1"
-        elif flt == "PREMIUM" and not cid:
-            q += " AND is_premium=1"
-        elif flt == "TODAY":
-            q += (" AND substr(joined_at,1,10)=?" if cid else " AND substr(requested_at,1,10)=?")
-            args.append(today_iso())
-        q += " ORDER BY joined_at DESC LIMIT 20"
-        rows = con.execute(q, tuple(args)).fetchall()
+    if cid:
+        q = "SELECT user_id, first_name, username, approved, blocked, joined_at " \
+            "FROM channel_members WHERE channel_id=?"
+        args = [cid]
+    else:
+        q = "SELECT user_id, first_name, username, approved, blocked, requested_at AS joined_at, " \
+            "is_premium FROM users WHERE 1=1"
+        args = []
+    if flt == "ACTIVE":
+        q += " AND blocked=0"
+    elif flt == "BLOCKED":
+        q += " AND blocked=1"
+    elif flt == "PREMIUM" and not cid:
+        q += " AND is_premium=1"
+    elif flt == "TODAY":
+        q += (" AND substr(joined_at,1,10)=?" if cid else " AND substr(requested_at,1,10)=?")
+        args.append(today_iso())
+    q += " ORDER BY joined_at DESC LIMIT 20"
+    rows = db_fetchall(q, tuple(args))
 
     header = f"👥 <b>USER MANAGEMENT</b> — filter: {flt}\n"
     if not rows:
@@ -1988,32 +2026,32 @@ async def show_users(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> None:
     actor = update.effective_user
-    with db() as con:
-        u = con.execute("SELECT * FROM users WHERE user_id=?", (target_id,)).fetchone()
-        owned = con.execute(
-            "SELECT COUNT(*) FROM channels WHERE owner_user_id=? AND status!='REMOVED'",
-            (target_id,)).fetchone()[0]
-        if not u:
-            await ui_edit(update, "User nahi mila.", kb([nav_row()]))
-            return
-        text = (
-            "👤 User Profile\n\n"
-            f"👤 Name: {html.escape(u['first_name'] or '')}\n"
-            f"🔗 Username: @{u['username'] or '—'}\n"
-            f"🆔 ID: {u['user_id']}\n"
-            f"📅 Joined: {(u['first_seen'] or u['requested_at'] or '')[:16].replace('T',' ')}\n"
-            f"📢 Source: {u['source'] or '—'}\n"
-            f"🟢 Status: {'🚫 Blocked' if u['blocked'] else 'Active'}\n"
-            f"📢 Owned channels: {owned}"
-        )
-        rows = []
-        if is_super_admin(actor.id):
-            if u["blocked"]:
-                rows.append([InlineKeyboardButton("✅ Unblock", callback_data=f"usr:unblock:{target_id}")])
-            else:
-                rows.append([InlineKeyboardButton("🚫 Block", callback_data=f"usr:block:{target_id}")])
-        rows.append(nav_row())
-        await ui_edit(update, text, kb(rows))
+    u = db_fetchone("SELECT * FROM users WHERE user_id=?", (target_id,))
+    owned = db_fetchone(
+        "SELECT COUNT(*) FROM channels WHERE owner_user_id=? AND status!='REMOVED'",
+        (target_id,)
+    )[0]
+    if not u:
+        await ui_edit(update, "User nahi mila.", kb([nav_row()]))
+        return
+    text = (
+        "👤 User Profile\n\n"
+        f"👤 Name: {html.escape(u['first_name'] or '')}\n"
+        f"🔗 Username: @{u['username'] or '—'}\n"
+        f"🆔 ID: {u['user_id']}\n"
+        f"📅 Joined: {(u['first_seen'] or u['requested_at'] or '')[:16].replace('T',' ')}\n"
+        f"📢 Source: {u['source'] or '—'}\n"
+        f"🟢 Status: {'🚫 Blocked' if u['blocked'] else 'Active'}\n"
+        f"📢 Owned channels: {owned}"
+    )
+    rows = []
+    if is_super_admin(actor.id):
+        if u["blocked"]:
+            rows.append([InlineKeyboardButton("✅ Unblock", callback_data=f"usr:unblock:{target_id}")])
+        else:
+            rows.append([InlineKeyboardButton("🚫 Block", callback_data=f"usr:block:{target_id}")])
+    rows.append(nav_row())
+    await ui_edit(update, text, kb(rows))
 
 async def user_block_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             target_id: int, block: bool) -> None:
@@ -2037,22 +2075,23 @@ async def show_logs(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int
     if not cid and not is_super_admin(user.id):
         await deny(update, "Admin only.")
         return
-    with db() as con:
-        if cid:
-            rows = con.execute(
-                "SELECT action, metadata, created_at FROM events WHERE channel_id=? "
-                "ORDER BY id DESC LIMIT 20", (cid,)).fetchall()
-        else:
-            rows = con.execute(
-                "SELECT action, metadata, created_at FROM events "
-                "ORDER BY id DESC LIMIT 20").fetchall()
-        if not rows:
-            body = "Koi log entry nahi."
-        else:
-            body = "\n".join(
-                f"• {(r['created_at'] or '')[11:16]} {r['action']} "
-                f"{html.escape((r['metadata'] or '')[:40])}" for r in rows)
-        await ui_edit(update, f"📋 LOGS\n\n{body}", kb([nav_row(f"ch:{cid}" if cid else "admin")]))
+    if cid:
+        rows = db_fetchall(
+            "SELECT action, metadata, created_at FROM events WHERE channel_id=? "
+            "ORDER BY id DESC LIMIT 20", (cid,)
+        )
+    else:
+        rows = db_fetchall(
+            "SELECT action, metadata, created_at FROM events "
+            "ORDER BY id DESC LIMIT 20"
+        )
+    if not rows:
+        body = "Koi log entry nahi."
+    else:
+        body = "\n".join(
+            f"• {(r['created_at'] or '')[11:16]} {r['action']} "
+            f"{html.escape((r['metadata'] or '')[:40])}" for r in rows)
+    await ui_edit(update, f"📋 LOGS\n\n{body}", kb([nav_row(f"ch:{cid}" if cid else "admin")]))
 
 # ----------------------------------------------------------------------------
 # REMOVE CHANNEL
@@ -2074,8 +2113,7 @@ async def channel_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, cid
     if not (is_super_admin(user.id) or user_owns_channel(user.id, cid)):
         await deny(update, "Remove denied.")
         return
-    with db() as con:
-        con.execute("UPDATE channels SET status='REMOVED' WHERE channel_id=?", (cid,))
+    db_execute("UPDATE channels SET status='REMOVED' WHERE channel_id=?", (cid,))
     log_event("CHANNEL_REMOVED", actor_user_id=user.id, channel_id=cid)
     await show_channels(update, context)
 
@@ -2088,9 +2126,7 @@ async def show_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await deny(update, "Sirf super admin ke liye.")
         return
     s = stats()
-    with db() as con:
-        active = con.execute(
-            "SELECT COUNT(*) FROM channels WHERE status='ACTIVE'").fetchone()[0]
+    active = db_fetchone("SELECT COUNT(*) FROM channels WHERE status='ACTIVE'")[0]
     text = (
         "╭━━━━━━━━━━━━━━━━━━━━╮\n"
         " 🛡️ ADMIN CENTER\n"
@@ -2120,19 +2156,19 @@ async def admin_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not is_super_admin(user.id):
         await deny(update, "Admin only.")
         return
-    with db() as con:
-        rows = con.execute(
-            "SELECT channel_id, title, owner_user_id, status FROM channels "
-            "WHERE status!='REMOVED' ORDER BY added_at DESC LIMIT 30").fetchall()
-        lines = ["📢 All Channels\n"]
-        kbrows = []
-        for r in rows:
-            lines.append(f"• {html.escape(r['title'])} "
-                         f"(owner {r['owner_user_id']}) — {r['status']}")
-            kbrows.append([InlineKeyboardButton(f"⚙️ {r['title'][:20]}",
-                                                callback_data=f"ch:{r['channel_id']}")])
-        kbrows.append(nav_row("admin"))
-        await ui_edit(update, "\n".join(lines) if rows else "Koi channel nahi.", kb(kbrows))
+    rows = db_fetchall(
+        "SELECT channel_id, title, owner_user_id, status FROM channels "
+        "WHERE status!='REMOVED' ORDER BY added_at DESC LIMIT 30"
+    )
+    lines = ["📢 All Channels\n"]
+    kbrows = []
+    for r in rows:
+        lines.append(f"• {html.escape(r['title'])} "
+                     f"(owner {r['owner_user_id']}) — {r['status']}")
+        kbrows.append([InlineKeyboardButton(f"⚙️ {r['title'][:20]}",
+                                            callback_data=f"ch:{r['channel_id']}")])
+    kbrows.append(nav_row("admin"))
+    await ui_edit(update, "\n".join(lines) if rows else "Koi channel nahi.", kb(kbrows))
 
 async def admin_global_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -2140,11 +2176,11 @@ async def admin_global_analytics(update: Update, context: ContextTypes.DEFAULT_T
         await deny(update, "Admin only.")
         return
     s = stats()
-    with db() as con:
-        sums = con.execute(
-            "SELECT COALESCE(SUM(sent),0) s, COALESCE(SUM(total),0) t, "
-            "COALESCE(SUM(failed),0) f FROM broadcasts").fetchone()
-        rate = (sums["s"] / sums["t"] * 100) if sums["t"] else 0
+    sums = db_fetchone(
+        "SELECT COALESCE(SUM(sent),0) s, COALESCE(SUM(total),0) t, "
+        "COALESCE(SUM(failed),0) f FROM broadcasts"
+    )
+    rate = (sums["s"] / sums["t"] * 100) if sums["t"] else 0
     text = (
         "📊 GLOBAL ANALYTICS\n\n"
         f"👥 Total users: {s['total']:,}\n"
@@ -2213,27 +2249,26 @@ async def admin_export_do(update: Update, context: ContextTypes.DEFAULT_TYPE, wh
         await deny(update, "Admin only.")
         return
     await update.effective_chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-    with db() as con:
-        if what == "users":
-            rows = con.execute("SELECT * FROM users ORDER BY requested_at DESC").fetchall()
-        elif what == "channels":
-            rows = con.execute("SELECT * FROM channels ORDER BY added_at DESC").fetchall()
-        elif what == "broadcasts":
-            rows = con.execute("SELECT * FROM broadcasts ORDER BY id DESC").fetchall()
-        else:
-            rows = con.execute("SELECT * FROM events ORDER BY id DESC LIMIT 5000").fetchall()
-        if not rows:
-            await context.bot.send_message(update.effective_chat.id, "Kuch export karne ko nahi.")
-            return
-        header = list(rows[0].keys())
-        data = _csv_bytes(header, ([r[k] for k in header] for r in rows))
-        fname = f"{what}{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-        await context.bot.send_document(
-            update.effective_chat.id,
-            document=InputFile(io.BytesIO(data), filename=fname),
-            caption=f"📄 {len(rows)} {what} exported.")
-        if update.callback_query:
-            await update.callback_query.answer("Exported ✅")
+    if what == "users":
+        rows = db_fetchall("SELECT * FROM users ORDER BY requested_at DESC")
+    elif what == "channels":
+        rows = db_fetchall("SELECT * FROM channels ORDER BY added_at DESC")
+    elif what == "broadcasts":
+        rows = db_fetchall("SELECT * FROM broadcasts ORDER BY id DESC")
+    else:
+        rows = db_fetchall("SELECT * FROM events ORDER BY id DESC LIMIT 5000")
+    if not rows:
+        await context.bot.send_message(update.effective_chat.id, "Kuch export karne ko nahi.")
+        return
+    header = list(rows[0].keys())
+    data = _csv_bytes(header, ([r[k] for k in header] for r in rows))
+    fname = f"{what}{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    await context.bot.send_document(
+        update.effective_chat.id,
+        document=InputFile(io.BytesIO(data), filename=fname),
+        caption=f"📄 {len(rows)} {what} exported.")
+    if update.callback_query:
+        await update.callback_query.answer("Exported ✅")
 
 # ----------------------------------------------------------------------------
 # GLOBAL BROADCAST (super admin)
@@ -2272,10 +2307,10 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     save_user(user, chat, approved=0, welcomed=0, source="join_request")
     channel_member_upsert(chat.id, user, approved=0)
-    with db() as con:
-        con.execute(
-            "INSERT INTO join_requests(channel_id,user_id,status,created_at) VALUES(?,?,?,?)",
-            (chat.id, user.id, "PENDING", utcnow_iso()))
+    db_execute(
+        "INSERT INTO join_requests(channel_id,user_id,status,created_at) VALUES(?,?,?,?)",
+        (chat.id, user.id, "PENDING", utcnow_iso())
+    )
     log_event("JOIN_REQUEST", actor_user_id=user.id, channel_id=chat.id,
               metadata=chat.title or str(chat.id))
     log.info("Join request: %s (%s) -> %s", user.first_name, user.id, chat.title)
@@ -2303,11 +2338,11 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             approved = True
             mark(user.id, "approved", 1)
             channel_member_mark(chat.id, user.id, "approved", 1)
-            with db() as con:
-                con.execute(
-                    "UPDATE join_requests SET status='APPROVED' "
-                    "WHERE channel_id=? AND user_id=? AND status='PENDING'",
-                    (chat.id, user.id))
+            db_execute(
+                "UPDATE join_requests SET status='APPROVED' "
+                "WHERE channel_id=? AND user_id=? AND status='PENDING'",
+                (chat.id, user.id)
+            )
             log_event("JOIN_APPROVED", actor_user_id=user.id, channel_id=chat.id, metadata="auto")
         except (BadRequest, Forbidden) as e:
             log.error("Approve failed for %s: %s", user.id, e)
@@ -2362,18 +2397,14 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not ch:
         return
     if new.status in ("left", "kicked"):
-        with db() as con:
-            con.execute("UPDATE channels SET status='BOT_REMOVED' WHERE channel_id=?", (chat.id,))
+        db_execute("UPDATE channels SET status='BOT_REMOVED' WHERE channel_id=?", (chat.id,))
         log_event("CHANNEL_UPDATED", channel_id=chat.id, metadata="bot_removed")
     elif new.status in ("administrator", "creator"):
         can_inv = int(bool(getattr(new, "can_invite_users", False)) or new.status == "creator")
-        with db() as con:
-            con.execute("UPDATE channels SET status='ACTIVE', can_invite=? WHERE channel_id=?",
-                        (can_inv, chat.id))
+        db_execute("UPDATE channels SET status='ACTIVE', can_invite=? WHERE channel_id=?",
+                   (can_inv, chat.id))
     elif new.status == "member":
-        with db() as con:
-            con.execute("UPDATE channels SET status='PERMISSION_LOST' WHERE channel_id=?",
-                        (chat.id,))
+        db_execute("UPDATE channels SET status='PERMISSION_LOST' WHERE channel_id=?", (chat.id,))
         log_event("CHANNEL_UPDATED", channel_id=chat.id, metadata="permission_lost")
 
 # ----------------------------------------------------------------------------
@@ -2423,11 +2454,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await msg.reply_html("⚠️ Numeric Telegram user ID bhejo.")
             return
         mid = int(text)
-        with db() as con:
-            con.execute(
-                "INSERT OR IGNORE INTO channel_managers(channel_id,user_id,added_at) "
-                "VALUES(?,?,?)",
-                (cid, mid, utcnow_iso()))
+        db_execute(
+            "INSERT OR IGNORE INTO channel_managers(channel_id,user_id,added_at) VALUES(?,?,?)",
+            (cid, mid, utcnow_iso())
+        )
         log_event("MANAGER_ADDED", actor_user_id=user.id, channel_id=cid, metadata=str(mid))
         _ud(context).clear()
         await msg.reply_html(
@@ -2711,8 +2741,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if data.startswith("bc:del:"):
             bid = _int(data.split(":")[2])
             if owns_broadcast(update.effective_user.id, bid) and bid not in RUNNING:
-                with db() as con:
-                    con.execute("UPDATE broadcasts SET status='CANCELLED' WHERE id=?", (bid,))
+                db_execute("UPDATE broadcasts SET status='CANCELLED' WHERE id=?", (bid,))
                 _ud(context).clear()
                 return await show_home(update, context)
 
@@ -2786,35 +2815,34 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @admin_only
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    with db() as con:
-        rows = con.execute(
-            "SELECT user_id, first_name, username, requested_at, approved "
-            "FROM users ORDER BY requested_at DESC LIMIT 20").fetchall()
-        if not rows:
-            await update.message.reply_text("Abhi koi user nahi hai.")
-            return
-        lines = ["👥 Last 20 users\n"]
-        for r in rows:
-            lines.append(
-                f"{'✅' if r['approved'] else '⏳'} {html.escape(r['first_name'] or '')} "
-                f"| @{r['username'] or '—'} | {r['user_id']}\n"
-                f" {(r['requested_at'] or '')[:16].replace('T', ' ')}")
-        await update.message.reply_html("\n".join(lines))
+    rows = db_fetchall(
+        "SELECT user_id, first_name, username, requested_at, approved "
+        "FROM users ORDER BY requested_at DESC LIMIT 20"
+    )
+    if not rows:
+        await update.message.reply_text("Abhi koi user nahi hai.")
+        return
+    lines = ["👥 Last 20 users\n"]
+    for r in rows:
+        lines.append(
+            f"{'✅' if r['approved'] else '⏳'} {html.escape(r['first_name'] or '')} "
+            f"| @{r['username'] or '—'} | {r['user_id']}\n"
+            f" {(r['requested_at'] or '')[:16].replace('T', ' ')}")
+    await update.message.reply_html("\n".join(lines))
 
 @admin_only
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-    with db() as con:
-        rows = con.execute("SELECT * FROM users ORDER BY requested_at DESC").fetchall()
-        if not rows:
-            await update.message.reply_text("Koi user nahi.")
-            return
-        header = list(rows[0].keys())
-        data = _csv_bytes(header, ([r[k] for k in header] for r in rows))
-        fname = f"users{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-        await update.message.reply_document(
-            document=InputFile(io.BytesIO(data), filename=fname),
-            caption=f"📄 {len(rows)} users exported.")
+    rows = db_fetchall("SELECT * FROM users ORDER BY requested_at DESC")
+    if not rows:
+        await update.message.reply_text("Koi user nahi.")
+        return
+    header = list(rows[0].keys())
+    data = _csv_bytes(header, ([r[k] for k in header] for r in rows))
+    fname = f"users{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    await update.message.reply_document(
+        document=InputFile(io.BytesIO(data), filename=fname),
+        caption=f"📄 {len(rows)} users exported.")
 
 @admin_only
 async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2852,11 +2880,10 @@ async def cmd_autoapprove(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 @admin_only
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    with db() as con:
-        rows = con.execute("SELECT key, value FROM settings").fetchall()
-        out = "\n".join(
-            f"• {r['key']}: {html.escape((r['value'] or '')[:80])}" for r in rows)
-        await update.message.reply_html(f"⚙️ Global Settings\n\n{out}")
+    rows = db_fetchall("SELECT key, value FROM settings")
+    out = "\n".join(
+        f"• {r['key']}: {html.escape((r['value'] or '')[:80])}" for r in rows)
+    await update.message.reply_html(f"⚙️ Global Settings\n\n{out}")
 
 @admin_only
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2867,219 +2894,27 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "Use: /broadcast <text> ya kisi message pe reply karke /broadcast\n"
             "Tip: rich campaigns ke liye /start → 📣 Broadcast.")
         return
-    with db() as con:
-        ids = [r["user_id"] for r in con.execute(
-            "SELECT user_id FROM users WHERE blocked=0").fetchall()]
-        status = await update.message.reply_html(f"📤 Broadcasting to {len(ids):,} users…")
-        sent = failed = 0
-        for i, uid in enumerate(ids, 1):
-            try:
-                if reply:
-                    await reply.copy(chat_id=uid)
-                else:
-                    await context.bot.send_message(uid, text, parse_mode=ParseMode.HTML,
-                                                   disable_web_page_preview=True)
-                sent += 1
-            except RetryAfter as e:
-                await asyncio.sleep(e.retry_after + 1)
-                failed += 1
-            except (Forbidden, BadRequest):
-                mark(uid, "blocked", 1)
-                failed += 1
-            except TimedOut:
-                failed += 1
-            await asyncio.sleep(BROADCAST_DELAY)
-            if i % 25 == 0:
-                try:
-                    await status.edit_text(f"📤 {i}/{len(ids)} — ✅ {sent} ❌ {failed}")
-                except Exception:
-                    pass
-        await status.edit_text(f"✅ Broadcast done.\nSent: {sent}\nFailed: {failed}")
-
-@admin_only
-async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    with db() as con:
-        rows = con.execute(
-            "SELECT user_id, first_name, username FROM users WHERE approved=0 "
-            "ORDER BY requested_at DESC LIMIT 30").fetchall()
-        if not rows:
-            await update.message.reply_text("🎉 Koi pending request nahi.")
-            return
-        out = "\n".join(
-            f"⏳ {html.escape(r['first_name'] or '')} | @{r['username'] or '—'} | {r['user_id']}"
-            for r in rows)
-        await update.message.reply_html(f"Pending ({len(rows)})\n\n{out}")
-
-@admin_only
-async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = " ".join(context.args).strip() if context.args else ""
-    if not query:
-        await update.message.reply_text("Use: /finduser <id | @username | name>")
-        return
-    with db() as con:
-        if query.isdigit():
-            rows = con.execute("SELECT * FROM users WHERE user_id=?", (int(query),)).fetchall()
-        elif query.startswith("@"):
-            rows = con.execute("SELECT * FROM users WHERE username=?", (query[1:],)).fetchall()
-        else:
-            rows = con.execute(
-                "SELECT * FROM users WHERE first_name LIKE ? OR username LIKE ? LIMIT 10",
-                (f"%{query}%", f"%{query}%")).fetchall()
-        if not rows:
-            await update.message.reply_text("Koi user nahi mila.")
-            return
-        out = "\n".join(
-            f"👤 {html.escape(r['first_name'] or '')} | @{r['username'] or '—'} "
-            f"| {r['user_id']} {'🚫' if r['blocked'] else ''}" for r in rows)
-        await update.message.reply_html(f"🔎 Results\n\n{out}")
-
-# ----------------------------------------------------------------------------
-# ERROR HANDLER
-# ----------------------------------------------------------------------------
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.error("Update caused error: %s", context.error, exc_info=context.error)
-
-# ----------------------------------------------------------------------------
-# FLASK WEB SERVER (for Render)
-# ----------------------------------------------------------------------------
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def index():
-    return "🤖 Bot is running. Use Telegram to interact."
-
-@flask_app.route('/health')
-def health():
-    return {"status": "ok", "service": "telegram-bot"}, 200
-
-def run_flask():
-    """Run Flask web server (in a separate thread)."""
-    port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port, threaded=True)
-
-# ----------------------------------------------------------------------------
-# MAIN — with retry and graceful shutdown
-# ----------------------------------------------------------------------------
-def build_application() -> Application:
-    if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE":
-        sys.exit("❌ BOT_TOKEN set karo: export BOT_TOKEN='123:ABC'")
-
-    # Create custom HTTPX client with long timeouts and connection pool
-    timeout = httpx.Timeout(
-        connect=TG_CONNECT_TIMEOUT,
-        read=TG_READ_TIMEOUT,
-        write=TG_WRITE_TIMEOUT,
-        pool=TG_POOL_TIMEOUT
-    )
-    limits = httpx.Limits(max_keepalive_connections=TG_POOL_SIZE,
-                          max_connections=TG_POOL_SIZE)
-    http_client = HTTPXRequest(
-        timeout=timeout,
-        connection_pool_size=TG_POOL_SIZE,
-        http_version="HTTP/1.1"
-    )
-
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .http_client(http_client)
-        .concurrent_updates(True)
-        .build()
-    )
-
-    # Register all handlers
-    app.add_handler(ChatJoinRequestHandler(on_join_request))
-    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(CommandHandler("panel", cmd_panel))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("users", cmd_users))
-    app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CommandHandler("setwelcome", cmd_setwelcome))
-    app.add_handler(CommandHandler("getwelcome", cmd_getwelcome))
-    app.add_handler(CommandHandler("autoapprove", cmd_autoapprove))
-    app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("pending", cmd_pending))
-    app.add_handler(CommandHandler("finduser", cmd_finduser))
-
-    app.add_handler(CallbackQueryHandler(on_thanks, pattern=r"^thanks$"))
-    app.add_handler(CallbackQueryHandler(on_noop, pattern=r"^noop:"))
-    app.add_handler(CallbackQueryHandler(on_callback))
-
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message))
-
-    app.add_error_handler(on_error)
-
-    # Scheduled job
-    if app.job_queue is not None:
-        app.job_queue.run_repeating(scheduled_job, interval=30, first=10)
-    else:
-        log.warning("JobQueue unavailable — scheduled campaigns won't auto-fire. "
-                    "Install python-telegram-bot[job-queue].")
-
-    return app
-
-async def bot_main() -> None:
-    app = build_application()
-    # Initialize and start polling
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-
-    # Wait for shutdown signal
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop_event.set)
-    await stop_event.wait()
-
-    # Graceful shutdown
-    log.info("Shutting down gracefully...")
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
-    log.info("Shutdown complete.")
-
-async def bot_main_with_retry() -> None:
-    attempt = 0
-    max_attempts = TG_MAX_RETRIES
-    while True:
+    rows = db_fetchall("SELECT user_id FROM users WHERE blocked=0")
+    ids = [r["user_id"] for r in rows]
+    status = await update.message.reply_html(f"📤 Broadcasting to {len(ids):,} users…")
+    sent = failed = 0
+    for i, uid in enumerate(ids, 1):
         try:
-            await bot_main()
-            break  # normal exit
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout,
-                NetworkError, TimedOut, TelegramError) as e:
-            attempt += 1
-            if attempt >= max_attempts:
-                log.critical("Bot failed to start after %d attempts. Exiting.", max_attempts)
-                sys.exit(1)
-            wait = min(2 ** attempt, 60)
-            log.warning("Bot start failed: %s. Retrying in %ds (attempt %d/%d)",
-                        e, wait, attempt, max_attempts)
-            await asyncio.sleep(wait)
-        except Exception as e:
-            log.critical("Unexpected error in bot main: %s", e, exc_info=True)
-            sys.exit(1)
-
-def main() -> None:
-    if not ADMIN_IDS:
-        log.warning("⚠️ ADMIN_IDS khali hai — super-admin features off; "
-                    "legacy admin commands sabke liye khule hain.")
-
-    db_init()
-    log.info("🤖 %s starting...", BOT_NAME)
-
-    # Start Flask in background thread (daemon)
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    log.info("Flask health server running on port %s", os.environ.get("PORT", 5000))
-
-    # Run bot with retries
-    asyncio.run(bot_main_with_retry())
-
-if __name__ == "__main__":
-    main()
+            if reply:
+                await reply.copy(chat_id=uid)
+            else:
+                await context.bot.send_message(uid, text, parse_mode=ParseMode.HTML,
+                                               disable_web_page_preview=True)
+            sent += 1
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            failed += 1
+        except (Forbidden, BadRequest):
+            mark(uid, "blocked", 1)
+            failed += 1
+        except TimedOut:
+            failed += 1
+        await asyncio.sleep(BROADCAST_DELAY)
+        if i % 25 == 0:
+            try:
+                await status.edit_text(f"📤
