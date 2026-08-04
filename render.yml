@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: telegram-channel-manager
+    runtime: python
+    repo: https://github.com/yourusername/yourrepo
+    plan: free
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: |
+      python bots.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DB_PATH
+        value: botdata.db
+      - key: PORT
+        value: 10000
+      - key: TG_CONNECT_TIMEOUT
+        value: 30
+      - key: TG_READ_TIMEOUT
+        value: 60
+      - key: TG_WRITE_TIMEOUT
+        value: 60
+      - key: TG_POOL_TIMEOUT
+        value: 30
+      - key: TG_POOL_SIZE
+        value: 50
+      - key: BROADCAST_WORKERS
+        value: 5
+      - key: BROADCAST_DELAY
+        value: 0.05
+      - key: BROADCAST_MAX_RETRIES
+        value: 3
+      - key: TG_MAX_RETRIES
+        value: 5
+      - key: WELCOME_DELAY
+        value: 1
+      - key: AUTO_APPROVE
+        value: true
