@@ -66,7 +66,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.request import HTTPXRequest
 
 # ----------------------------------------------------------------------------
 # CONFIG
@@ -85,7 +84,7 @@ BROADCAST_WORKERS = max(1, int(os.getenv("BROADCAST_WORKERS", "5")))
 BROADCAST_DELAY = float(os.getenv("BROADCAST_DELAY", "0.05"))
 BROADCAST_MAX_RETRIES = int(os.getenv("BROADCAST_MAX_RETRIES", "3"))
 
-# HTTP / Telegram timeouts
+# HTTP / Telegram timeouts – these are now passed to the builder
 TG_CONNECT_TIMEOUT = float(os.getenv("TG_CONNECT_TIMEOUT", "30.0"))
 TG_READ_TIMEOUT = float(os.getenv("TG_READ_TIMEOUT", "60.0"))
 TG_WRITE_TIMEOUT = float(os.getenv("TG_WRITE_TIMEOUT", "60.0"))
@@ -3036,20 +3035,14 @@ def build_application() -> Application:
     if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE":
         sys.exit("❌ BOT_TOKEN set karo: export BOT_TOKEN='123:ABC'")
 
-    # Create HTTPXRequest with timeout parameters directly (PTB 20.6 API)
-    http_client = HTTPXRequest(
-        connect_timeout=TG_CONNECT_TIMEOUT,
-        read_timeout=TG_READ_TIMEOUT,
-        write_timeout=TG_WRITE_TIMEOUT,
-        pool_timeout=TG_POOL_TIMEOUT,
-        connection_pool_size=TG_POOL_SIZE,
-        http_version="1.1"  # Fixed: must be '1.1', '2.0', or '2' (no "HTTP/" prefix)
-    )
-
+    # Use ApplicationBuilder with timeout settings directly – no custom HTTP client
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .http_client(http_client)
+        .connect_timeout(TG_CONNECT_TIMEOUT)
+        .read_timeout(TG_READ_TIMEOUT)
+        .write_timeout(TG_WRITE_TIMEOUT)
+        .pool_timeout(TG_POOL_TIMEOUT)
         .concurrent_updates(True)
         .build()
     )
