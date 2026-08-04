@@ -2917,4 +2917,183 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await asyncio.sleep(BROADCAST_DELAY)
         if i % 25 == 0:
             try:
-                await status.edit_text(f"📤
+                await status.edit_text(f"📤 {i}/{len(ids)} — ✅ {sent} ❌ {failed}")
+            except Exception:
+                pass
+    await status.edit_text(f"✅ Broadcast done.\nSent: {sent}\nFailed: {failed}")
+
+@admin_only
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = db_fetchall(
+        "SELECT user_id, first_name, username FROM users WHERE approved=0 "
+        "ORDER BY requested_at DESC LIMIT 30"
+    )
+    if not rows:
+        await update.message.reply_text("🎉 Koi pending request nahi.")
+        return
+    out = "\n".join(
+        f"⏳ {html.escape(r['first_name'] or '')} | @{r['username'] or '—'} | {r['user_id']}"
+        for r in rows)
+    await update.message.reply_html(f"Pending ({len(rows)})\n\n{out}")
+
+@admin_only
+async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        await update.message.reply_text("Use: /finduser <id | @username | name>")
+        return
+    if query.isdigit():
+        rows = db_fetchall("SELECT * FROM users WHERE user_id=?", (int(query),))
+    elif query.startswith("@"):
+        rows = db_fetchall("SELECT * FROM users WHERE username=?", (query[1:],))
+    else:
+        rows = db_fetchall(
+            "SELECT * FROM users WHERE first_name LIKE ? OR username LIKE ? LIMIT 10",
+            (f"%{query}%", f"%{query}%")
+        )
+    if not rows:
+        await update.message.reply_text("Koi user nahi mila.")
+        return
+    out = "\n".join(
+        f"👤 {html.escape(r['first_name'] or '')} | @{r['username'] or '—'} "
+        f"| {r['user_id']} {'🚫' if r['blocked'] else ''}" for r in rows)
+    await update.message.reply_html(f"🔎 Results\n\n{out}")
+
+# ----------------------------------------------------------------------------
+# ERROR HANDLER
+# ----------------------------------------------------------------------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Update caused error: %s", context.error, exc_info=context.error)
+
+# ----------------------------------------------------------------------------
+# FLASK WEB SERVER (for Render)
+# ----------------------------------------------------------------------------
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def index():
+    return "🤖 Bot is running. Use Telegram to interact."
+
+@flask_app.route('/health')
+def health():
+    return jsonify({"status": "ok", "service": "telegram-bot"}), 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    flask_app.run(host="0.0.0.0", port=port, threaded=True)
+
+# ----------------------------------------------------------------------------
+# MAIN — with retry and graceful shutdown
+# ----------------------------------------------------------------------------
+def build_application() -> Application:
+    if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE":
+        sys.exit("❌ BOT_TOKEN set karo: export BOT_TOKEN='123:ABC'")
+
+    timeout = httpx.Timeout(
+        connect=TG_CONNECT_TIMEOUT,
+        read=TG_READ_TIMEOUT,
+        write=TG_WRITE_TIMEOUT,
+        pool=TG_POOL_TIMEOUT
+    )
+    http_client = HTTPXRequest(
+        timeout=timeout,
+        connection_pool_size=TG_POOL_SIZE,
+        http_version="HTTP/1.1"
+    )
+
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .http_client(http_client)
+        .concurrent_updates(True)
+        .build()
+    )
+
+    app.add_handler(ChatJoinRequestHandler(on_join_request))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("panel", cmd_panel))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("setwelcome", cmd_setwelcome))
+    app.add_handler(CommandHandler("getwelcome", cmd_getwelcome))
+    app.add_handler(CommandHandler("autoapprove", cmd_autoapprove))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("finduser", cmd_finduser))
+
+    app.add_handler(CallbackQueryHandler(on_thanks, pattern=r"^thanks$"))
+    app.add_handler(CallbackQueryHandler(on_noop, pattern=r"^noop:"))
+    app.add_handler(CallbackQueryHandler(on_callback))
+
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message))
+
+    app.add_error_handler(on_error)
+
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(scheduled_job, interval=30, first=10)
+    else:
+        log.warning("JobQueue unavailable — scheduled campaigns won't auto-fire. "
+                    "Install python-telegram-bot[job-queue].")
+
+    return app
+
+async def bot_main() -> None:
+    app = build_application()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop_event.set)
+    await stop_event.wait()
+
+    log.info("Shutting down gracefully...")
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
+    log.info("Shutdown complete.")
+
+async def bot_main_with_retry() -> None:
+    attempt = 0
+    while True:
+        try:
+            await bot_main()
+            break
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout,
+                NetworkError, TimedOut, TelegramError) as e:
+            attempt += 1
+            if attempt >= TG_MAX_RETRIES:
+                log.critical("Bot failed to start after %d attempts. Exiting.", TG_MAX_RETRIES)
+                sys.exit(1)
+            wait = min(2 ** attempt, 60)
+            log.warning("Bot start failed: %s. Retrying in %ds (attempt %d/%d)",
+                        e, wait, attempt, TG_MAX_RETRIES)
+            await asyncio.sleep(wait)
+        except Exception as e:
+            log.critical("Unexpected error in bot main: %s", e, exc_info=True)
+            sys.exit(1)
+
+def main() -> None:
+    if not ADMIN_IDS:
+        log.warning("⚠️ ADMIN_IDS khali hai — super-admin features off; "
+                    "legacy admin commands sabke liye khule hain.")
+
+    db_init()
+    log.info("🤖 %s starting...", BOT_NAME)
+
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    log.info("Flask health server running on port %s", os.environ.get("PORT", 5000))
+
+    asyncio.run(bot_main_with_retry())
+
+if __name__ == "__main__":
+    main()
