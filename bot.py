@@ -21,11 +21,12 @@ import sqlite3
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
-# ---- Flask for web server ----
+# ---- Flask web server ----
 from flask import Flask, jsonify
 
 # ---- Telegram ----
@@ -36,6 +37,8 @@ except Exception:
     pass
 
 import httpx
+from werkzeug.serving import make_server
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -140,17 +143,25 @@ def _db_connect():
     con.execute("PRAGMA busy_timeout=30000")
     return con
 
+@contextmanager
+def get_db_connection():
+    """Context manager for database connections."""
+    con = _db_connect()
+    try:
+        yield con
+    finally:
+        con.close()
+
 def db_execute(sql: str, params: tuple = ()) -> sqlite3.Cursor:
     """Execute a single SQL statement with retry on lock."""
     attempt = 0
     while attempt < DB_RETRY_ATTEMPTS:
         with _db_lock:
             try:
-                con = _db_connect()
-                cur = con.execute(sql, params)
-                con.commit()
-                con.close()
-                return cur
+                with get_db_connection() as con:
+                    cur = con.execute(sql, params)
+                    con.commit()
+                    return cur
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e).lower():
                     attempt += 1
@@ -158,10 +169,6 @@ def db_execute(sql: str, params: tuple = ()) -> sqlite3.Cursor:
                     log.warning("DB locked, retry %d/%d in %.2fs", attempt, DB_RETRY_ATTEMPTS, wait)
                     time.sleep(wait)
                     continue
-                raise
-            except Exception:
-                if con:
-                    con.close()
                 raise
     raise sqlite3.OperationalError(f"Database locked after {DB_RETRY_ATTEMPTS} attempts")
 
@@ -171,11 +178,9 @@ def db_fetchall(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
     while attempt < DB_RETRY_ATTEMPTS:
         with _db_lock:
             try:
-                con = _db_connect()
-                cur = con.execute(sql, params)
-                rows = cur.fetchall()
-                con.close()
-                return rows
+                with get_db_connection() as con:
+                    cur = con.execute(sql, params)
+                    return cur.fetchall()
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e).lower():
                     attempt += 1
@@ -183,10 +188,6 @@ def db_fetchall(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
                     log.warning("DB locked (fetch), retry %d/%d in %.2fs", attempt, DB_RETRY_ATTEMPTS, wait)
                     time.sleep(wait)
                     continue
-                raise
-            except Exception:
-                if con:
-                    con.close()
                 raise
     raise sqlite3.OperationalError(f"Database locked after {DB_RETRY_ATTEMPTS} attempts")
 
@@ -200,11 +201,10 @@ def db_executemany(sql: str, params_list: list[tuple]) -> None:
     while attempt < DB_RETRY_ATTEMPTS:
         with _db_lock:
             try:
-                con = _db_connect()
-                con.executemany(sql, params_list)
-                con.commit()
-                con.close()
-                return
+                with get_db_connection() as con:
+                    con.executemany(sql, params_list)
+                    con.commit()
+                    return
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e).lower():
                     attempt += 1
@@ -212,10 +212,6 @@ def db_executemany(sql: str, params_list: list[tuple]) -> None:
                     log.warning("DB locked (executemany), retry %d/%d in %.2fs", attempt, DB_RETRY_ATTEMPTS, wait)
                     time.sleep(wait)
                     continue
-                raise
-            except Exception:
-                if con:
-                    con.close()
                 raise
     raise sqlite3.OperationalError(f"Database locked after {DB_RETRY_ATTEMPTS} attempts")
 
@@ -230,192 +226,191 @@ def db_init() -> None:
     while attempt < DB_RETRY_ATTEMPTS:
         with _db_lock:
             try:
-                con = _db_connect()
-                con.executescript("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        user_id INTEGER PRIMARY KEY,
-                        first_name TEXT,
-                        last_name TEXT,
-                        username TEXT,
-                        language TEXT,
-                        is_premium INTEGER DEFAULT 0,
-                        chat_id INTEGER,
-                        chat_title TEXT,
-                        requested_at TEXT,
-                        approved INTEGER DEFAULT 0,
-                        welcomed INTEGER DEFAULT 0,
-                        blocked INTEGER DEFAULT 0,
-                        source TEXT,
-                        first_seen TEXT,
-                        last_seen TEXT
-                    );
+                with get_db_connection() as con:
+                    con.executescript("""
+                        CREATE TABLE IF NOT EXISTS users (
+                            user_id INTEGER PRIMARY KEY,
+                            first_name TEXT,
+                            last_name TEXT,
+                            username TEXT,
+                            language TEXT,
+                            is_premium INTEGER DEFAULT 0,
+                            chat_id INTEGER,
+                            chat_title TEXT,
+                            requested_at TEXT,
+                            approved INTEGER DEFAULT 0,
+                            welcomed INTEGER DEFAULT 0,
+                            blocked INTEGER DEFAULT 0,
+                            source TEXT,
+                            first_seen TEXT,
+                            last_seen TEXT
+                        );
 
-                    CREATE TABLE IF NOT EXISTS settings (
-                        key TEXT PRIMARY KEY,
-                        value TEXT
-                    );
+                        CREATE TABLE IF NOT EXISTS settings (
+                            key TEXT PRIMARY KEY,
+                            value TEXT
+                        );
 
-                    CREATE TABLE IF NOT EXISTS channels (
-                        channel_id INTEGER PRIMARY KEY,
-                        title TEXT,
-                        username TEXT,
-                        owner_user_id INTEGER,
-                        added_at TEXT,
-                        status TEXT DEFAULT 'ACTIVE',
-                        can_invite INTEGER DEFAULT 0,
-                        ctype TEXT
-                    );
+                        CREATE TABLE IF NOT EXISTS channels (
+                            channel_id INTEGER PRIMARY KEY,
+                            title TEXT,
+                            username TEXT,
+                            owner_user_id INTEGER,
+                            added_at TEXT,
+                            status TEXT DEFAULT 'ACTIVE',
+                            can_invite INTEGER DEFAULT 0,
+                            ctype TEXT
+                        );
 
-                    CREATE TABLE IF NOT EXISTS channel_settings (
-                        channel_id INTEGER PRIMARY KEY,
-                        auto_approve INTEGER DEFAULT 1,
-                        welcome_enabled INTEGER DEFAULT 1,
-                        welcome_text TEXT,
-                        pending_text TEXT,
-                        broadcast_enabled INTEGER DEFAULT 1,
-                        logging_enabled INTEGER DEFAULT 1,
-                        scheduler_enabled INTEGER DEFAULT 1,
-                        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
-                    );
+                        CREATE TABLE IF NOT EXISTS channel_settings (
+                            channel_id INTEGER PRIMARY KEY,
+                            auto_approve INTEGER DEFAULT 1,
+                            welcome_enabled INTEGER DEFAULT 1,
+                            welcome_text TEXT,
+                            pending_text TEXT,
+                            broadcast_enabled INTEGER DEFAULT 1,
+                            logging_enabled INTEGER DEFAULT 1,
+                            scheduler_enabled INTEGER DEFAULT 1,
+                            FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+                        );
 
-                    CREATE TABLE IF NOT EXISTS channel_members (
-                        channel_id INTEGER,
-                        user_id INTEGER,
-                        first_name TEXT,
-                        username TEXT,
-                        approved INTEGER DEFAULT 0,
-                        blocked INTEGER DEFAULT 0,
-                        joined_at TEXT,
-                        PRIMARY KEY(channel_id, user_id)
-                    );
+                        CREATE TABLE IF NOT EXISTS channel_members (
+                            channel_id INTEGER,
+                            user_id INTEGER,
+                            first_name TEXT,
+                            username TEXT,
+                            approved INTEGER DEFAULT 0,
+                            blocked INTEGER DEFAULT 0,
+                            joined_at TEXT,
+                            PRIMARY KEY(channel_id, user_id)
+                        );
 
-                    CREATE TABLE IF NOT EXISTS channel_managers (
-                        channel_id INTEGER,
-                        user_id INTEGER,
-                        added_at TEXT,
-                        PRIMARY KEY(channel_id, user_id),
-                        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
-                    );
+                        CREATE TABLE IF NOT EXISTS channel_managers (
+                            channel_id INTEGER,
+                            user_id INTEGER,
+                            added_at TEXT,
+                            PRIMARY KEY(channel_id, user_id),
+                            FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+                        );
 
-                    CREATE TABLE IF NOT EXISTS channel_manager_permissions (
-                        channel_id INTEGER,
-                        user_id INTEGER,
-                        permission TEXT,
-                        PRIMARY KEY(channel_id, user_id, permission)
-                    );
+                        CREATE TABLE IF NOT EXISTS channel_manager_permissions (
+                            channel_id INTEGER,
+                            user_id INTEGER,
+                            permission TEXT,
+                            PRIMARY KEY(channel_id, user_id, permission)
+                        );
 
-                    CREATE TABLE IF NOT EXISTS join_requests (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        channel_id INTEGER,
-                        user_id INTEGER,
-                        status TEXT,
-                        created_at TEXT
-                    );
+                        CREATE TABLE IF NOT EXISTS join_requests (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            channel_id INTEGER,
+                            user_id INTEGER,
+                            status TEXT,
+                            created_at TEXT
+                        );
 
-                    CREATE TABLE IF NOT EXISTS broadcasts (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        owner_user_id INTEGER,
-                        channel_id INTEGER,
-                        kind TEXT,
-                        text TEXT,
-                        file_id TEXT,
-                        caption TEXT,
-                        copy_chat_id INTEGER,
-                        copy_msg_id INTEGER,
-                        audience TEXT,
-                        status TEXT DEFAULT 'DRAFT',
-                        total INTEGER DEFAULT 0,
-                        sent INTEGER DEFAULT 0,
-                        failed INTEGER DEFAULT 0,
-                        blocked INTEGER DEFAULT 0,
-                        created_at TEXT,
-                        started_at TEXT,
-                        finished_at TEXT
-                    );
+                        CREATE TABLE IF NOT EXISTS broadcasts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            owner_user_id INTEGER,
+                            channel_id INTEGER,
+                            kind TEXT,
+                            text TEXT,
+                            file_id TEXT,
+                            caption TEXT,
+                            copy_chat_id INTEGER,
+                            copy_msg_id INTEGER,
+                            audience TEXT,
+                            status TEXT DEFAULT 'DRAFT',
+                            total INTEGER DEFAULT 0,
+                            sent INTEGER DEFAULT 0,
+                            failed INTEGER DEFAULT 0,
+                            blocked INTEGER DEFAULT 0,
+                            created_at TEXT,
+                            started_at TEXT,
+                            finished_at TEXT
+                        );
 
-                    CREATE TABLE IF NOT EXISTS broadcast_buttons (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        broadcast_id INTEGER,
-                        row_idx INTEGER,
-                        col_idx INTEGER,
-                        text TEXT,
-                        btype TEXT,
-                        value TEXT,
-                        FOREIGN KEY(broadcast_id) REFERENCES broadcasts(id) ON DELETE CASCADE
-                    );
+                        CREATE TABLE IF NOT EXISTS broadcast_buttons (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            broadcast_id INTEGER,
+                            row_idx INTEGER,
+                            col_idx INTEGER,
+                            text TEXT,
+                            btype TEXT,
+                            value TEXT,
+                            FOREIGN KEY(broadcast_id) REFERENCES broadcasts(id) ON DELETE CASCADE
+                        );
 
-                    CREATE TABLE IF NOT EXISTS scheduled_broadcasts (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        broadcast_id INTEGER,
-                        scheduled_at TEXT,
-                        timezone TEXT,
-                        status TEXT DEFAULT 'SCHEDULED',
-                        FOREIGN KEY(broadcast_id) REFERENCES broadcasts(id) ON DELETE CASCADE
-                    );
+                        CREATE TABLE IF NOT EXISTS scheduled_broadcasts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            broadcast_id INTEGER,
+                            scheduled_at TEXT,
+                            timezone TEXT,
+                            status TEXT DEFAULT 'SCHEDULED',
+                            FOREIGN KEY(broadcast_id) REFERENCES broadcasts(id) ON DELETE CASCADE
+                        );
 
-                    CREATE TABLE IF NOT EXISTS events (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        actor_user_id INTEGER,
-                        channel_id INTEGER,
-                        action TEXT,
-                        metadata TEXT,
-                        created_at TEXT
-                    );
+                        CREATE TABLE IF NOT EXISTS events (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            actor_user_id INTEGER,
+                            channel_id INTEGER,
+                            action TEXT,
+                            metadata TEXT,
+                            created_at TEXT
+                        );
 
-                    CREATE INDEX IF NOT EXISTS ix_channels_owner ON channels(owner_user_id);
-                    CREATE INDEX IF NOT EXISTS ix_cmembers_channel ON channel_members(channel_id);
-                    CREATE INDEX IF NOT EXISTS ix_cmembers_user ON channel_members(user_id);
-                    CREATE INDEX IF NOT EXISTS ix_managers_channel ON channel_managers(channel_id);
-                    CREATE INDEX IF NOT EXISTS ix_bcast_owner ON broadcasts(owner_user_id);
-                    CREATE INDEX IF NOT EXISTS ix_bcast_channel ON broadcasts(channel_id);
-                    CREATE INDEX IF NOT EXISTS ix_bcast_status ON broadcasts(status);
-                    CREATE INDEX IF NOT EXISTS ix_btargets_bcast ON broadcast_buttons(broadcast_id);
-                    CREATE INDEX IF NOT EXISTS ix_events_created ON events(created_at);
-                    CREATE INDEX IF NOT EXISTS ix_sched_status ON scheduled_broadcasts(status);
-                """)
+                        CREATE INDEX IF NOT EXISTS ix_channels_owner ON channels(owner_user_id);
+                        CREATE INDEX IF NOT EXISTS ix_cmembers_channel ON channel_members(channel_id);
+                        CREATE INDEX IF NOT EXISTS ix_cmembers_user ON channel_members(user_id);
+                        CREATE INDEX IF NOT EXISTS ix_managers_channel ON channel_managers(channel_id);
+                        CREATE INDEX IF NOT EXISTS ix_bcast_owner ON broadcasts(owner_user_id);
+                        CREATE INDEX IF NOT EXISTS ix_bcast_channel ON broadcasts(channel_id);
+                        CREATE INDEX IF NOT EXISTS ix_bcast_status ON broadcasts(status);
+                        CREATE INDEX IF NOT EXISTS ix_btargets_bcast ON broadcast_buttons(broadcast_id);
+                        CREATE INDEX IF NOT EXISTS ix_events_created ON events(created_at);
+                        CREATE INDEX IF NOT EXISTS ix_sched_status ON scheduled_broadcasts(status);
+                    """)
 
-                # Migrations
-                def col_exists(table, col):
-                    res = con.execute(f"PRAGMA table_info({table})").fetchall()
-                    return any(r["name"] == col for r in res)
+                    # Migrations
+                    def col_exists(table, col):
+                        res = con.execute(f"PRAGMA table_info({table})").fetchall()
+                        return any(r["name"] == col for r in res)
 
-                if col_exists("events", "created_at") is False:
-                    con.execute("ALTER TABLE events ADD COLUMN created_at TEXT")
-                    con.execute("UPDATE events SET created_at=? WHERE created_at IS NULL", (utcnow_iso(),))
-                if col_exists("join_requests", "created_at") is False:
-                    con.execute("ALTER TABLE join_requests ADD COLUMN created_at TEXT")
-                    con.execute("UPDATE join_requests SET created_at=? WHERE created_at IS NULL", (utcnow_iso(),))
-                for col in ("first_seen", "last_seen"):
-                    if col_exists("users", col) is False:
-                        con.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
-                con.execute(
-                    "UPDATE users SET first_seen=COALESCE(first_seen, requested_at), "
-                    "last_seen=COALESCE(last_seen, requested_at) "
-                    "WHERE first_seen IS NULL OR last_seen IS NULL"
-                )
+                    if col_exists("events", "created_at") is False:
+                        con.execute("ALTER TABLE events ADD COLUMN created_at TEXT")
+                        con.execute("UPDATE events SET created_at=? WHERE created_at IS NULL", (utcnow_iso(),))
+                    if col_exists("join_requests", "created_at") is False:
+                        con.execute("ALTER TABLE join_requests ADD COLUMN created_at TEXT")
+                        con.execute("UPDATE join_requests SET created_at=? WHERE created_at IS NULL", (utcnow_iso(),))
+                    for col in ("first_seen", "last_seen"):
+                        if col_exists("users", col) is False:
+                            con.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+                    con.execute(
+                        "UPDATE users SET first_seen=COALESCE(first_seen, requested_at), "
+                        "last_seen=COALESCE(last_seen, requested_at) "
+                        "WHERE first_seen IS NULL OR last_seen IS NULL"
+                    )
 
-                ver = con.execute("PRAGMA user_version").fetchone()[0]
-                if ver < SCHEMA_VERSION:
-                    con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    ver = con.execute("PRAGMA user_version").fetchone()[0]
+                    if ver < SCHEMA_VERSION:
+                        con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
-                # Default settings
-                con.execute(
-                    "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-                    ("welcome_text", DEFAULT_WELCOME)
-                )
-                con.execute(
-                    "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-                    ("pending_text", DEFAULT_PENDING_MSG)
-                )
-                con.execute(
-                    "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-                    ("auto_approve", os.getenv("AUTO_APPROVE", "true").lower())
-                )
+                    # Default settings
+                    con.execute(
+                        "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                        ("welcome_text", DEFAULT_WELCOME)
+                    )
+                    con.execute(
+                        "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                        ("pending_text", DEFAULT_PENDING_MSG)
+                    )
+                    con.execute(
+                        "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                        ("auto_approve", os.getenv("AUTO_APPROVE", "true").lower())
+                    )
 
-                con.commit()
-                con.close()
-                log.info("DB ready at %s (schema v%s)", DB_PATH, SCHEMA_VERSION)
-                return
+                    con.commit()
+                    log.info("DB ready at %s (schema v%s)", DB_PATH, SCHEMA_VERSION)
+                    return
             except sqlite3.OperationalError as e:
                 if "database is locked" in str(e).lower():
                     attempt += 1
@@ -423,10 +418,6 @@ def db_init() -> None:
                     log.warning("DB init locked, retry %d/%d in %.2fs", attempt, DB_RETRY_ATTEMPTS, wait)
                     time.sleep(wait)
                     continue
-                raise
-            except Exception:
-                if con:
-                    con.close()
                 raise
     raise sqlite3.OperationalError(f"Database locked after {DB_RETRY_ATTEMPTS} attempts during init")
 
@@ -595,10 +586,11 @@ def set_channel_setting(channel_id: int, key: str, value) -> None:
     db_execute(f"UPDATE channel_settings SET {key}=? WHERE channel_id=?", (value, channel_id))
 
 def channel_stats(channel_id: int) -> dict:
-    total = db_fetchone("SELECT COUNT() FROM channel_members WHERE channel_id=?", (channel_id,))[0]
-    appr = db_fetchone("SELECT COUNT() FROM channel_members WHERE channel_id=? AND approved=1", (channel_id,))[0]
-    blk = db_fetchone("SELECT COUNT() FROM channel_members WHERE channel_id=? AND blocked=1", (channel_id,))[0]
-    pend = db_fetchone("SELECT COUNT() FROM join_requests WHERE channel_id=? AND status='PENDING'", (channel_id,))[0]
+    with get_db_connection() as con:
+        total = con.execute("SELECT COUNT() FROM channel_members WHERE channel_id=?", (channel_id,)).fetchone()[0]
+        appr = con.execute("SELECT COUNT() FROM channel_members WHERE channel_id=? AND approved=1", (channel_id,)).fetchone()[0]
+        blk = con.execute("SELECT COUNT() FROM channel_members WHERE channel_id=? AND blocked=1", (channel_id,)).fetchone()[0]
+        pend = con.execute("SELECT COUNT() FROM join_requests WHERE channel_id=? AND status='PENDING'", (channel_id,)).fetchone()[0]
     return {"total": total, "approved": appr, "blocked": blk, "pending": pend}
 
 def channel_member_upsert(channel_id, user, *, approved=0) -> None:
@@ -626,13 +618,14 @@ def channel_member_mark(channel_id: int, user_id: int, field_: str, value: int =
 
 # ---- global stats ----
 def stats() -> dict:
-    total = db_fetchone("SELECT COUNT() FROM users")[0]
-    appr = db_fetchone("SELECT COUNT() FROM users WHERE approved=1")[0]
-    welc = db_fetchone("SELECT COUNT() FROM users WHERE welcomed=1")[0]
-    blk = db_fetchone("SELECT COUNT() FROM users WHERE blocked=1")[0]
-    today = db_fetchone("SELECT COUNT() FROM users WHERE substr(requested_at,1,10)=?", (today_iso(),))[0]
-    channels = db_fetchone("SELECT COUNT() FROM channels WHERE status!='REMOVED'")[0]
-    campaigns = db_fetchone("SELECT COUNT(*) FROM broadcasts")[0]
+    with get_db_connection() as con:
+        total = con.execute("SELECT COUNT() FROM users").fetchone()[0]
+        appr = con.execute("SELECT COUNT() FROM users WHERE approved=1").fetchone()[0]
+        welc = con.execute("SELECT COUNT() FROM users WHERE welcomed=1").fetchone()[0]
+        blk = con.execute("SELECT COUNT() FROM users WHERE blocked=1").fetchone()[0]
+        today = con.execute("SELECT COUNT() FROM users WHERE substr(requested_at,1,10)=?", (today_iso(),)).fetchone()[0]
+        channels = con.execute("SELECT COUNT() FROM channels WHERE status!='REMOVED'").fetchone()[0]
+        campaigns = con.execute("SELECT COUNT(*) FROM broadcasts").fetchone()[0]
     return {"total": total, "approved": appr, "welcomed": welc, "blocked": blk,
             "today": today, "channels": channels, "campaigns": campaigns}
 
@@ -658,13 +651,51 @@ def render(template: str, user, chat_title: str = "") -> str:
     )
 
 def validate_template(text: str) -> tuple[bool, str]:
+    """Validate Telegram HTML template for balanced tags and allowed attributes."""
     if not text.strip():
         return False, "Template khaali nahi ho sakta."
-    for tag in ("b", "i", "u", "s", "code", "pre"):
-        if text.count(f"<{tag}>") != text.count(f"</{tag}>"):
-            return False, f"HTML tag <{tag}> balanced nahi hai."
-    if text.count("<a ") != text.count(""):
-        return False, "HTML tag <a> balanced nahi hai."
+
+    # Allowed tags and their attributes
+    allowed_tags = {"b", "i", "u", "s", "code", "pre", "a"}
+    allowed_attrs = {"a": {"href"}}
+
+    # Simple tag extraction using regex
+    tag_re = re.compile(r'</?([a-zA-Z]+)(?:\s+[^>]*)?>')
+    stack = []
+    pos = 0
+    # Find all tags
+    for match in tag_re.finditer(text):
+        tag = match.group(1).lower()
+        # Check if tag is allowed
+        if tag not in allowed_tags:
+            return False, f"Tag <{tag}> is not allowed."
+        # Check attributes (only for <a>)
+        if tag == "a" and not match.group().startswith("</"):
+            attrs = re.findall(r'(\w+)\s*=\s*("[^"]*"|\'[^\']*\'|[^\s>]+)', match.group())
+            # we only allow href
+            href_found = False
+            for attr_name, attr_value in attrs:
+                if attr_name == "href":
+                    href_found = True
+                    # Ensure href is a valid URL or tg://
+                    val = attr_value.strip('"\'').strip()
+                    if not (val.startswith("http://") or val.startswith("https://") or val.startswith("tg://")):
+                        return False, "href must be a valid http/https or tg:// URL"
+                else:
+                    return False, f"Attribute '{attr_name}' not allowed on <a>"
+            if not href_found:
+                return False, "<a> tag must have href attribute"
+        # Check closing tags
+        if match.group().startswith("</"):
+            if not stack or stack[-1] != tag:
+                return False, f"Closing tag </{tag}> does not match opening tag."
+            stack.pop()
+        else:
+            stack.append(tag)
+
+    if stack:
+        return False, f"Unclosed tags: {', '.join(stack)}"
+
     return True, "ok"
 
 URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
@@ -1204,39 +1235,36 @@ async def show_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await deny(update, "Analytics permission nahi hai.")
         return
     cutoff = _period_cutoff(period)
-    with _db_lock:  # we need a transaction for multiple queries
-        con = _db_connect()
-        c = con.cursor()
+    with get_db_connection() as con:
         base = "SELECT COUNT(*) FROM channel_members WHERE channel_id=?"
         args = [cid]
         if cutoff:
-            new_users = c.execute(base + " AND joined_at>=?", (cid, cutoff)).fetchone()[0]
+            new_users = con.execute(base + " AND joined_at>=?", (cid, cutoff)).fetchone()[0]
         else:
-            new_users = c.execute(base, (cid,)).fetchone()[0]
-        total = c.execute(base, (cid,)).fetchone()[0]
-        approved = c.execute(base + " AND approved=1", (cid,)).fetchone()[0]
-        blocked = c.execute(base + " AND blocked=1", (cid,)).fetchone()[0]
+            new_users = con.execute(base, (cid,)).fetchone()[0]
+        total = con.execute(base, (cid,)).fetchone()[0]
+        approved = con.execute(base + " AND approved=1", (cid,)).fetchone()[0]
+        blocked = con.execute(base + " AND blocked=1", (cid,)).fetchone()[0]
 
         jr_base = "SELECT COUNT(*) FROM join_requests WHERE channel_id=?"
         if cutoff:
-            joins = c.execute(jr_base + " AND created_at>=?", (cid, cutoff)).fetchone()[0]
-            approvals = c.execute(
+            joins = con.execute(jr_base + " AND created_at>=?", (cid, cutoff)).fetchone()[0]
+            approvals = con.execute(
                 jr_base + " AND status='APPROVED' AND created_at>=?", (cid, cutoff)
             ).fetchone()[0]
         else:
-            joins = c.execute(jr_base, (cid,)).fetchone()[0]
-            approvals = c.execute(jr_base + " AND status='APPROVED'", (cid,)).fetchone()[0]
+            joins = con.execute(jr_base, (cid,)).fetchone()[0]
+            approvals = con.execute(jr_base + " AND status='APPROVED'", (cid,)).fetchone()[0]
 
         bc_base = "SELECT COUNT(*) FROM broadcasts WHERE channel_id=?"
-        bsent = c.execute("SELECT COALESCE(SUM(sent),0), COALESCE(SUM(total),0) "
-                          "FROM broadcasts WHERE channel_id=?", (cid,)).fetchone()
+        bsent = con.execute("SELECT COALESCE(SUM(sent),0), COALESCE(SUM(total),0) "
+                            "FROM broadcasts WHERE channel_id=?", (cid,)).fetchone()
         if cutoff:
-            bc_count = c.execute(bc_base + " AND created_at>=?", (cid, cutoff)).fetchone()[0]
+            bc_count = con.execute(bc_base + " AND created_at>=?", (cid, cutoff)).fetchone()[0]
         else:
-            bc_count = c.execute(bc_base, (cid,)).fetchone()[0]
+            bc_count = con.execute(bc_base, (cid,)).fetchone()[0]
         success = (bsent[0] / bsent[1] * 100) if bsent[1] else 0.0
         active = total - blocked
-        con.close()
 
     text = (
         "📊 <b>ANALYTICS</b>\n"
@@ -1455,7 +1483,7 @@ async def bc_audience(update: Update, context: ContextTypes.DEFAULT_TYPE, bid: i
     await ui_edit(update, text, kb(rows))
 
 # ---- button builder ----
-async def bc_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, bid: int) -> None:
+def get_button_builder_data(bid: int) -> tuple[str, InlineKeyboardMarkup]:
     btns = broadcast_buttons(bid)
     if btns:
         preview_rows = {}
@@ -1479,7 +1507,15 @@ async def bc_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, bid: in
         [InlineKeyboardButton("✅ Done", callback_data=f"bc:compose:{bid}")],
         nav_row(f"bc:compose:{bid}"),
     ]
-    await ui_edit(update, text, kb(rows))
+    return text, kb(rows)
+
+async def bc_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, bid: int) -> None:
+    text, markup = get_button_builder_data(bid)
+    await ui_edit(update, text, markup)
+
+async def show_button_builder_message(update: Update, context: ContextTypes.DEFAULT_TYPE, bid: int) -> None:
+    text, markup = get_button_builder_data(bid)
+    await update.effective_message.reply_html(text, reply_markup=markup)
 
 async def bc_add_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE,
                               bid: int, new_row: bool) -> None:
@@ -1676,9 +1712,12 @@ async def _send_worker(bot, b: sqlite3.Row, markup, camp: Campaign,
 
 async def run_campaign(context: ContextTypes.DEFAULT_TYPE, bid: int,
                        status_chat_id: int | None = None,
-                       status_msg_id: int | None = None) -> None:
+                       status_msg_id: int | None = None,
+                       scheduled_id: int | None = None) -> None:
     b = get_broadcast(bid)
     if not b:
+        if scheduled_id:
+            db_execute("UPDATE scheduled_broadcasts SET status='FAILED' WHERE id=?", (scheduled_id,))
         return
     ids = resolve_audience_ids(b)
     markup = build_button_markup(bid)
@@ -1686,6 +1725,8 @@ async def run_campaign(context: ContextTypes.DEFAULT_TYPE, bid: int,
     camp = Campaign(bid=bid, total=len(ids))
     RUNNING[bid] = camp
     update_broadcast(bid, status="RUNNING", total=len(ids), started_at=utcnow_iso())
+    if scheduled_id:
+        db_execute("UPDATE scheduled_broadcasts SET status='RUNNING' WHERE id=?", (scheduled_id,))
     log_event("BROADCAST_STARTED", actor_user_id=b["owner_user_id"],
               channel_id=b["channel_id"], metadata=f"broadcast={bid} total={len(ids)}")
 
@@ -1738,6 +1779,9 @@ async def run_campaign(context: ContextTypes.DEFAULT_TYPE, bid: int,
     update_broadcast(bid, status=final_status, sent=camp.sent,
                      failed=camp.failed, blocked=camp.blocked,
                      finished_at=utcnow_iso())
+    if scheduled_id:
+        sched_status = "COMPLETED" if final_status == "COMPLETED" else "FAILED"
+        db_execute("UPDATE scheduled_broadcasts SET status=? WHERE id=?", (sched_status, scheduled_id))
     log_event("BROADCAST_COMPLETED" if final_status == "COMPLETED" else "BROADCAST_FAILED",
               actor_user_id=b["owner_user_id"], channel_id=b["channel_id"],
               metadata=f"broadcast={bid} sent={camp.sent} failed={camp.failed} blocked={camp.blocked}")
@@ -1830,10 +1874,11 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         (now,)
     )
     for r in due:
-        db_execute("UPDATE scheduled_broadcasts SET status='RUNNING' WHERE id=?", (r["sid"],))
         b = get_broadcast(r["bid"])
         if not b:
+            db_execute("UPDATE scheduled_broadcasts SET status='FAILED' WHERE id=?", (r["sid"],))
             continue
+        # Start campaign and pass scheduled_id so it updates the scheduled record
         owner = b["owner_user_id"]
         status = None
         try:
@@ -1842,11 +1887,12 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode=ParseMode.HTML)
         except TelegramError:
             pass
+        # run_campaign will update scheduled status on completion
         context.application.create_task(run_campaign(
             context, r["bid"],
             status.chat_id if status else None,
-            status.message_id if status else None))
-        db_execute("UPDATE scheduled_broadcasts SET status='COMPLETED' WHERE id=?", (r["sid"],))
+            status.message_id if status else None,
+            scheduled_id=r["sid"]))
 
 async def show_scheduled(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int) -> None:
     user = update.effective_user
@@ -2510,7 +2556,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                    _ud(context).get("btn_new_row", True))
         _ud(context).clear()
         await msg.reply_html("✅ Button added.")
-        await bc_buttons_msg(update, context, bid)
+        await show_button_builder_message(update, context, bid)
         return
 
     if flow == "bc_schedule":
@@ -2529,20 +2575,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"✅ Scheduled for <code>{when.isoformat(timespec='minutes')} UTC</code>.",
             reply_markup=home_kb(user))
         return
-
-async def bc_buttons_msg(update: Update, context: ContextTypes.DEFAULT_TYPE, bid: int) -> None:
-    btns = broadcast_buttons(bid)
-    layout = ("\n".join(
-        " ".join(f"[{b['text']}]" for b in btns if b["row_idx"] == r)
-        for r in sorted({x["row_idx"] for x in btns})) or "(none)")
-    rows = [
-        [InlineKeyboardButton("➕ Add Button", callback_data=f"bc:baddrow:{bid}"),
-         InlineKeyboardButton("↔️ Add to last row", callback_data=f"bc:baddcol:{bid}")],
-        [InlineKeyboardButton("🗑 Delete last", callback_data=f"bc:bdel:{bid}"),
-         InlineKeyboardButton("✅ Done", callback_data=f"bc:compose:{bid}")],
-    ]
-    await update.effective_message.reply_html(
-        f"🔘 BUTTON BUILDER\n\n{layout}", reply_markup=kb(rows))
 
 # ----------------------------------------------------------------------------
 # CENTRAL CALLBACK ROUTER
@@ -2966,7 +2998,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Update caused error: %s", context.error, exc_info=context.error)
 
 # ----------------------------------------------------------------------------
-# FLASK WEB SERVER (for Render)
+# FLASK WEB SERVER (for Render) - improved with werkzeug server
 # ----------------------------------------------------------------------------
 flask_app = Flask(__name__)
 
@@ -2976,11 +3008,26 @@ def index():
 
 @flask_app.route('/health')
 def health():
+    # Simple health check - can be expanded to check DB etc.
     return jsonify({"status": "ok", "service": "telegram-bot"}), 200
 
+# Global reference to the server for shutdown
+flask_server = None
+
 def run_flask():
+    global flask_server
     port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port, threaded=True)
+    # Use Werkzeug's make_server for better control
+    flask_server = make_server('0.0.0.0', port, flask_app, threaded=True)
+    log.info("Flask server starting on port %s", port)
+    flask_server.serve_forever()
+
+def stop_flask():
+    global flask_server
+    if flask_server:
+        log.info("Shutting down Flask server...")
+        flask_server.shutdown()
+        flask_server = None
 
 # ----------------------------------------------------------------------------
 # MAIN — with retry and graceful shutdown
@@ -2989,17 +3036,16 @@ def build_application() -> Application:
     if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE":
         sys.exit("❌ BOT_TOKEN set karo: export BOT_TOKEN='123:ABC'")
 
+    # Create httpx client with timeouts
     timeout = httpx.Timeout(
         connect=TG_CONNECT_TIMEOUT,
         read=TG_READ_TIMEOUT,
         write=TG_WRITE_TIMEOUT,
         pool=TG_POOL_TIMEOUT
     )
-    http_client = HTTPXRequest(
-        timeout=timeout,
-        connection_pool_size=TG_POOL_SIZE,
-        http_version="HTTP/1.1"
-    )
+    limits = httpx.Limits(max_keepalive_connections=TG_POOL_SIZE, max_connections=TG_POOL_SIZE)
+    client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=False)
+    http_client = HTTPXRequest(client=client, connection_pool_size=TG_POOL_SIZE)
 
     app = (
         ApplicationBuilder()
@@ -3049,16 +3095,21 @@ async def bot_main() -> None:
     await app.start()
     await app.updater.start_polling()
 
+    # Wait for shutdown signal
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)
+
     await stop_event.wait()
 
     log.info("Shutting down gracefully...")
+    # Stop polling and application
     await app.updater.stop()
     await app.stop()
     await app.shutdown()
+    # Stop Flask server
+    stop_flask()
     log.info("Shutdown complete.")
 
 async def bot_main_with_retry() -> None:
@@ -3089,11 +3140,18 @@ def main() -> None:
     db_init()
     log.info("🤖 %s starting...", BOT_NAME)
 
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    # Start Flask server in a separate thread (non-daemon so it can be stopped)
+    flask_thread = threading.Thread(target=run_flask, daemon=False)
     flask_thread.start()
     log.info("Flask health server running on port %s", os.environ.get("PORT", 5000))
 
-    asyncio.run(bot_main_with_retry())
+    try:
+        asyncio.run(bot_main_with_retry())
+    finally:
+        # Ensure Flask server is stopped even if bot_main raises
+        stop_flask()
+        if flask_thread.is_alive():
+            flask_thread.join(timeout=5)
 
 if __name__ == "__main__":
     main()
